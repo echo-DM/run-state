@@ -153,14 +153,18 @@ func TestFullWorkerDoesNotPrefetchBeyondLeaseDuration(t *testing.T) {
 }
 
 type taskView struct {
-	ID           string  `json:"id"`
-	Status       string  `json:"status"`
-	CurrentStep  int     `json:"current_step"`
-	LeaseVersion int64   `json:"lease_version"`
-	WorkerID     *string `json:"worker_id"`
+	ID           string     `json:"id"`
+	Status       string     `json:"status"`
+	CurrentStep  int        `json:"current_step"`
+	LeaseVersion int64      `json:"lease_version"`
+	WorkerID     *string    `json:"worker_id"`
+	RetryAt      *time.Time `json:"retry_at"`
 	Steps        []struct {
-		Status  string `json:"status"`
-		Attempt int    `json:"attempt"`
+		Status         string          `json:"status"`
+		Attempt        int             `json:"attempt"`
+		IdempotencyKey string          `json:"idempotency_key"`
+		ResolvedInput  json.RawMessage `json:"resolved_input"`
+		Error          *string         `json:"error"`
 	} `json:"steps"`
 }
 

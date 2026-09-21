@@ -8,6 +8,7 @@ import (
 const (
 	StatusRunnable  = "RUNNABLE"
 	StatusRunning   = "RUNNING"
+	StatusRetryWait = "RETRY_WAIT"
 	StatusSucceeded = "SUCCEEDED"
 	StatusFailed    = "FAILED"
 
@@ -37,6 +38,7 @@ type Task struct {
 	CreatedAt          time.Time       `json:"created_at"`
 	UpdatedAt          time.Time       `json:"updated_at"`
 	RunAt              time.Time       `json:"run_at"`
+	RetryAt            *time.Time      `json:"retry_at,omitempty"`
 	WorkerID           *string         `json:"worker_id,omitempty"`
 	LeaseVersion       int64           `json:"lease_version"`
 	LeaseExpiresAt     *time.Time      `json:"lease_expires_at,omitempty"`

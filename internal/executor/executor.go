@@ -12,12 +12,38 @@ import (
 
 type implementation struct {
 	validate func(json.RawMessage) error
-	execute  func(context.Context, json.RawMessage) (json.RawMessage, error)
+	execute  func(context.Context, store.StepAttempt) (json.RawMessage, error)
 }
 
 var implementations = map[string]implementation{
 	"echo":  {validate: validateEcho, execute: executeEcho},
 	"sleep": {validate: validateSleep, execute: executeSleep},
+	"flaky": {validate: validateFlaky, execute: executeFlaky},
+}
+
+type Failure struct {
+	Class store.FailureClass
+	Cause error
+}
+
+type flakyInput struct {
+	TemporaryFailures *int            `json:"temporary_failures"`
+	Permanent         bool            `json:"permanent"`
+	Value             json.RawMessage `json:"value"`
+}
+
+func (failure *Failure) Error() string { return failure.Cause.Error() }
+func (failure *Failure) Unwrap() error { return failure.Cause }
+
+func Classify(err error) store.FailureClass {
+	var failure *Failure
+	if errors.As(err, &failure) {
+		return failure.Class
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return store.FailureTemporary
+	}
+	return store.FailurePermanent
 }
 
 func ValidateDefinition(stepType string, input json.RawMessage) error {
@@ -33,7 +59,7 @@ func Execute(ctx context.Context, attempt store.StepAttempt) (json.RawMessage, j
 	if !ok {
 		return nil, nil, fmt.Errorf("unknown step type %q", attempt.StepType)
 	}
-	output, err := implementation.execute(ctx, attempt.ResolvedInput)
+	output, err := implementation.execute(ctx, attempt)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -51,11 +77,11 @@ func validateEcho(input json.RawMessage) error {
 	return nil
 }
 
-func executeEcho(_ context.Context, inputJSON json.RawMessage) (json.RawMessage, error) {
+func executeEcho(_ context.Context, attempt store.StepAttempt) (json.RawMessage, error) {
 	var input struct {
 		Value json.RawMessage `json:"value"`
 	}
-	if err := json.Unmarshal(inputJSON, &input); err != nil || len(input.Value) == 0 {
+	if err := json.Unmarshal(attempt.ResolvedInput, &input); err != nil || len(input.Value) == 0 {
 		return nil, errors.New("invalid echo input")
 	}
 	encoded, err := json.Marshal(map[string]json.RawMessage{"value": input.Value})
@@ -81,11 +107,11 @@ func validateSleep(input json.RawMessage) error {
 	return nil
 }
 
-func executeSleep(ctx context.Context, inputJSON json.RawMessage) (json.RawMessage, error) {
+func executeSleep(ctx context.Context, attempt store.StepAttempt) (json.RawMessage, error) {
 	var input struct {
 		Duration string `json:"duration"`
 	}
-	if err := json.Unmarshal(inputJSON, &input); err != nil {
+	if err := json.Unmarshal(attempt.ResolvedInput, &input); err != nil {
 		return nil, errors.New("invalid sleep input")
 	}
 	duration, err := time.ParseDuration(input.Duration)
@@ -100,5 +126,44 @@ func executeSleep(ctx context.Context, inputJSON json.RawMessage) (json.RawMessa
 	case <-timer.C:
 	}
 	output, _ := json.Marshal(map[string]string{"slept": input.Duration})
+	return output, nil
+}
+
+func validateFlaky(input json.RawMessage) error {
+	var definition flakyInput
+	if err := json.Unmarshal(input, &definition); err != nil {
+		return errors.New("flaky input must be a JSON object")
+	}
+	if definition.TemporaryFailures != nil && *definition.TemporaryFailures < 0 {
+		return errors.New("flaky temporary_failures must be non-negative")
+	}
+	if definition.Permanent && definition.TemporaryFailures != nil && *definition.TemporaryFailures != 0 {
+		return errors.New("flaky input cannot combine permanent and temporary failures")
+	}
+	if len(definition.Value) == 0 {
+		return errors.New("flaky input requires value")
+	}
+	return nil
+}
+
+func executeFlaky(_ context.Context, attempt store.StepAttempt) (json.RawMessage, error) {
+	var input flakyInput
+	if err := json.Unmarshal(attempt.ResolvedInput, &input); err != nil || len(input.Value) == 0 {
+		return nil, &Failure{Class: store.FailurePermanent, Cause: errors.New("invalid flaky input")}
+	}
+	if input.Permanent {
+		return nil, &Failure{Class: store.FailurePermanent, Cause: errors.New("controlled_permanent_failure")}
+	}
+	temporaryFailures := 0
+	if input.TemporaryFailures != nil {
+		temporaryFailures = *input.TemporaryFailures
+	}
+	if attempt.Attempt <= temporaryFailures {
+		return nil, &Failure{Class: store.FailureTemporary, Cause: errors.New("controlled_temporary_failure")}
+	}
+	output, err := json.Marshal(map[string]json.RawMessage{"value": input.Value})
+	if err != nil {
+		return nil, &Failure{Class: store.FailurePermanent, Cause: fmt.Errorf("encode flaky output: %w", err)}
+	}
 	return output, nil
 }

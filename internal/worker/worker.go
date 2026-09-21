@@ -110,7 +110,7 @@ func (worker *Worker) executeClaim(parent context.Context, claim store.Claim) {
 		}
 		outcome := store.StepOutcome{Output: output, Checkpoint: checkpoint}
 		if executeErr != nil {
-			outcome = store.StepOutcome{Error: executeErr.Error()}
+			outcome = store.StepOutcome{Error: executeErr.Error(), FailureClass: executor.Classify(executeErr)}
 		}
 		if err := worker.store.FinishStep(taskContext, claim.Token(), attempt, outcome); err != nil {
 			worker.options.Logger.Warn("finish step rejected", "task", claim.TaskID, "step", step.ID, "worker", claim.WorkerID, "lease_version", claim.LeaseVersion, "attempt", attempt.Attempt, "error", err)

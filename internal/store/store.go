@@ -45,16 +45,25 @@ type StepAttempt struct {
 	StepIndex      int
 	StepType       string
 	Attempt        int
+	MaxAttempts    int
 	IdempotencyKey string
 	ResolvedInput  json.RawMessage
 	TimeoutSeconds int
 }
 
 type StepOutcome struct {
-	Output     json.RawMessage
-	Checkpoint json.RawMessage
-	Error      string
+	Output       json.RawMessage
+	Checkpoint   json.RawMessage
+	Error        string
+	FailureClass FailureClass
 }
+
+type FailureClass string
+
+const (
+	FailurePermanent FailureClass = "permanent"
+	FailureTemporary FailureClass = "temporary"
+)
 
 type Options struct {
 	LeaseDuration time.Duration
@@ -92,12 +101,12 @@ func (s *Store) CreateTask(ctx context.Context, definition task.Definition) (tas
 	err = tx.QueryRow(ctx, `
 		INSERT INTO tasks (id, tenant_id, status, run_at, task_timeout_seconds)
 		VALUES ($1, $2, 'RUNNABLE', clock_timestamp(), $3)
-		RETURNING id, tenant_id, status, created_at, updated_at, run_at, worker_id,
+		RETURNING id, tenant_id, status, created_at, updated_at, run_at, retry_at, worker_id,
 		          lease_version, lease_expires_at, cancel_requested, current_step,
 		          checkpoint, task_timeout_seconds, first_started_at, deadline_at`,
 		taskID, definition.TenantID, definition.TaskTimeoutSeconds,
 	).Scan(&created.ID, &created.TenantID, &created.Status, &created.CreatedAt, &created.UpdatedAt,
-		&created.RunAt, &created.WorkerID, &created.LeaseVersion, &created.LeaseExpiresAt,
+		&created.RunAt, &created.RetryAt, &created.WorkerID, &created.LeaseVersion, &created.LeaseExpiresAt,
 		&created.CancelRequested, &created.CurrentStep, &created.Checkpoint,
 		&created.TaskTimeoutSeconds, &created.FirstStartedAt, &created.DeadlineAt)
 	if err != nil {
@@ -134,12 +143,12 @@ func (s *Store) CreateTask(ctx context.Context, definition task.Definition) (tas
 func (s *Store) LoadTask(ctx context.Context, taskID string) (task.Task, error) {
 	var loaded task.Task
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, tenant_id, status, created_at, updated_at, run_at, worker_id,
+		SELECT id, tenant_id, status, created_at, updated_at, run_at, retry_at, worker_id,
 		       lease_version, lease_expires_at, cancel_requested, current_step,
 		       checkpoint, task_timeout_seconds, first_started_at, deadline_at
 		FROM tasks WHERE id = $1`, taskID,
 	).Scan(&loaded.ID, &loaded.TenantID, &loaded.Status, &loaded.CreatedAt, &loaded.UpdatedAt,
-		&loaded.RunAt, &loaded.WorkerID, &loaded.LeaseVersion, &loaded.LeaseExpiresAt,
+		&loaded.RunAt, &loaded.RetryAt, &loaded.WorkerID, &loaded.LeaseVersion, &loaded.LeaseExpiresAt,
 		&loaded.CancelRequested, &loaded.CurrentStep, &loaded.Checkpoint,
 		&loaded.TaskTimeoutSeconds, &loaded.FirstStartedAt, &loaded.DeadlineAt)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -388,7 +397,6 @@ func (s *Store) StartStep(ctx context.Context, lease LeaseToken, stepID string) 
 	attempt.TaskID = lease.TaskID
 	var configuredInput, persistedResolvedInput json.RawMessage
 	var status string
-	var maxAttempts int
 	err = tx.QueryRow(ctx, `
 		SELECT id, step_index, step_type, attempt, max_attempts, status,
 		       idempotency_key, timeout_seconds, input, resolved_input
@@ -396,7 +404,7 @@ func (s *Store) StartStep(ctx context.Context, lease LeaseToken, stepID string) 
 		WHERE task_id = $1 AND id = $2
 		FOR UPDATE`, lease.TaskID, stepID,
 	).Scan(&attempt.StepID, &attempt.StepIndex, &attempt.StepType, &attempt.Attempt,
-		&maxAttempts, &status, &attempt.IdempotencyKey, &attempt.TimeoutSeconds,
+		&attempt.MaxAttempts, &status, &attempt.IdempotencyKey, &attempt.TimeoutSeconds,
 		&configuredInput, &persistedResolvedInput)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return StepAttempt{}, ErrConflict
@@ -405,7 +413,7 @@ func (s *Store) StartStep(ctx context.Context, lease LeaseToken, stepID string) 
 		return StepAttempt{}, fmt.Errorf("lock step: %w", err)
 	}
 
-	if attempt.StepIndex != locked.currentStep || (status != task.StepPending && status != task.StepFailed) || attempt.Attempt >= maxAttempts {
+	if attempt.StepIndex != locked.currentStep || (status != task.StepPending && status != task.StepFailed) || attempt.Attempt >= attempt.MaxAttempts {
 		return StepAttempt{}, ErrConflict
 	}
 	var unfinishedPredecessors bool
@@ -484,11 +492,11 @@ func (s *Store) FinishStep(ctx context.Context, lease LeaseToken, attempt StepAt
 	}
 
 	var stepStatus string
-	var persistedAttempt, stepIndex int
+	var persistedAttempt, persistedMaxAttempts, stepIndex int
 	err = tx.QueryRow(ctx, `
-		SELECT status, attempt, step_index FROM task_steps
+		SELECT status, attempt, max_attempts, step_index FROM task_steps
 		WHERE task_id = $1 AND id = $2 FOR UPDATE`, lease.TaskID, attempt.StepID,
-	).Scan(&stepStatus, &persistedAttempt, &stepIndex)
+	).Scan(&stepStatus, &persistedAttempt, &persistedMaxAttempts, &stepIndex)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrConflict
 	}
@@ -498,6 +506,7 @@ func (s *Store) FinishStep(ctx context.Context, lease LeaseToken, attempt StepAt
 	if stepStatus != task.StepRunning || persistedAttempt != attempt.Attempt || stepIndex != locked.currentStep {
 		return ErrConflict
 	}
+	attempt.MaxAttempts = persistedMaxAttempts
 	if len(outcome.Output) > maxJSONBytes {
 		outcome.Error = "output_too_large"
 		outcome.Output = nil
@@ -514,15 +523,34 @@ func (s *Store) FinishStep(ctx context.Context, lease LeaseToken, attempt StepAt
 			WHERE task_id = $1 AND id = $2`, lease.TaskID, attempt.StepID, outcome.Error); err != nil {
 			return fmt.Errorf("fail step: %w", err)
 		}
-		if _, err := tx.Exec(ctx, `
+		retrying := outcome.FailureClass == FailureTemporary && attempt.Attempt < attempt.MaxAttempts
+		if retrying {
+			delaySeconds := 1 << min(attempt.Attempt-1, 6)
+			if delaySeconds > 60 {
+				delaySeconds = 60
+			}
+			if _, err := tx.Exec(ctx, `
+				UPDATE tasks
+				SET status = 'RETRY_WAIT', retry_at = clock_timestamp() + ($2 * interval '1 second'),
+				    worker_id = NULL, lease_expires_at = NULL, updated_at = clock_timestamp()
+				WHERE id = $1`, lease.TaskID, delaySeconds); err != nil {
+				return fmt.Errorf("wait to retry task: %w", err)
+			}
+		} else if _, err := tx.Exec(ctx, `
 			UPDATE tasks
-			SET status = 'FAILED', worker_id = NULL, lease_expires_at = NULL,
+			SET status = 'FAILED', retry_at = NULL, worker_id = NULL, lease_expires_at = NULL,
 			    updated_at = clock_timestamp()
 			WHERE id = $1`, lease.TaskID); err != nil {
 			return fmt.Errorf("fail task: %w", err)
 		}
-		if err := insertFinishEvents(ctx, tx, lease, attempt, "STEP_FAILED", outcome.Error, true); err != nil {
+		if err := insertFinishEvents(ctx, tx, lease, attempt, "STEP_FAILED", outcome.Error, !retrying); err != nil {
 			return err
+		}
+		if retrying {
+			payload, _ := json.Marshal(map[string]any{"step_id": attempt.StepID, "attempt": attempt.Attempt})
+			if _, err := tx.Exec(ctx, `INSERT INTO task_events (task_id, event_type, payload) VALUES ($1, 'TASK_RETRY_WAIT', $2)`, lease.TaskID, payload); err != nil {
+				return fmt.Errorf("insert retry wait event: %w", err)
+			}
 		}
 		return s.commitWithFactCheck(ctx, tx, "finish_step", func(confirmCtx context.Context) (bool, error) {
 			return s.stepFinishPersisted(confirmCtx, attempt, outcome)
@@ -567,6 +595,43 @@ func (s *Store) FinishStep(ctx context.Context, lease LeaseToken, attempt StepAt
 	return s.commitWithFactCheck(ctx, tx, "finish_step", func(confirmCtx context.Context) (bool, error) {
 		return s.stepFinishPersisted(confirmCtx, attempt, outcome)
 	})
+}
+
+func (s *Store) WakeDueRetry(ctx context.Context) (bool, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false, fmt.Errorf("begin retry wake: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if err := setTransactionLimits(ctx, tx); err != nil {
+		return false, err
+	}
+	var taskID string
+	err = tx.QueryRow(ctx, `
+		SELECT id FROM tasks
+		WHERE status = 'RETRY_WAIT' AND retry_at <= clock_timestamp()
+		  AND cancel_requested = false
+		  AND (deadline_at IS NULL OR deadline_at > clock_timestamp())
+		ORDER BY retry_at, id
+		FOR UPDATE SKIP LOCKED LIMIT 1`).Scan(&taskID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("select due retry: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE tasks SET status = 'RUNNABLE', retry_at = NULL, updated_at = clock_timestamp()
+		WHERE id = $1`, taskID); err != nil {
+		return false, fmt.Errorf("wake due retry: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO task_events (task_id, event_type) VALUES ($1, 'TASK_RETRY_READY')`, taskID); err != nil {
+		return false, fmt.Errorf("insert retry ready event: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("commit retry wake: %w", err)
+	}
+	return true, nil
 }
 
 func (s *Store) commitWithFactCheck(ctx context.Context, tx pgx.Tx, operation string, confirm func(context.Context) (bool, error)) error {
@@ -618,7 +683,11 @@ func (s *Store) stepFinishPersisted(ctx context.Context, attempt StepAttempt, ou
 	if outcome.Error != "" {
 		stepStatus = task.StepFailed
 		eventType = "STEP_FAILED"
-		taskStatus = task.StatusFailed
+		if outcome.FailureClass == FailureTemporary && attempt.Attempt < attempt.MaxAttempts {
+			taskStatus = task.StatusRetryWait
+		} else {
+			taskStatus = task.StatusFailed
+		}
 	}
 	var persisted bool
 	err := s.pool.QueryRow(ctx, `
