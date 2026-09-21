@@ -78,7 +78,7 @@ func (worker *Worker) runSlot(ctx context.Context) {
 }
 
 func (worker *Worker) executeClaim(parent context.Context, claim store.Claim) {
-	taskContext, cancelTask := context.WithCancel(parent)
+	taskContext, cancelTask := context.WithDeadline(parent, claim.DeadlineAt)
 	heartbeatDone := make(chan error, 1)
 	go worker.heartbeat(taskContext, claim.Token(), cancelTask, heartbeatDone)
 	defer func() {
@@ -106,14 +106,29 @@ func (worker *Worker) executeClaim(parent context.Context, claim store.Claim) {
 		stepContext, cancelStep := context.WithTimeout(taskContext, time.Duration(attempt.TimeoutSeconds)*time.Second)
 		output, checkpoint, executeErr := executor.Execute(stepContext, attempt, executor.Options{FakeToolURL: worker.options.FakeToolURL})
 		cancelStep()
+		if errors.Is(taskContext.Err(), context.DeadlineExceeded) {
+			worker.timeoutClaim(claim)
+			return
+		}
 		if taskContext.Err() != nil {
 			return
 		}
 		outcome := store.StepOutcome{Output: output, Checkpoint: checkpoint}
 		if executeErr != nil {
-			outcome = store.StepOutcome{Error: executeErr.Error(), FailureClass: executor.Classify(executeErr)}
+			errorText := executeErr.Error()
+			if errors.Is(executeErr, context.DeadlineExceeded) {
+				errorText = "step_timeout"
+			}
+			outcome = store.StepOutcome{Error: errorText, FailureClass: executor.Classify(executeErr)}
 		}
-		if err := worker.store.FinishStep(taskContext, claim.Token(), attempt, outcome); err != nil {
+		finishContext, cancelFinish := context.WithTimeout(context.WithoutCancel(taskContext), 2*time.Second)
+		err = worker.store.FinishStep(finishContext, claim.Token(), attempt, outcome)
+		cancelFinish()
+		if errors.Is(err, store.ErrDeadlineExceeded) {
+			worker.timeoutClaim(claim)
+			return
+		}
+		if err != nil {
 			worker.options.Logger.Warn("finish step rejected", "task", claim.TaskID, "step", step.ID, "worker", claim.WorkerID, "lease_version", claim.LeaseVersion, "attempt", attempt.Attempt, "error", err)
 			return
 		}
@@ -121,6 +136,14 @@ func (worker *Worker) executeClaim(parent context.Context, claim store.Claim) {
 		if executeErr != nil {
 			return
 		}
+	}
+}
+
+func (worker *Worker) timeoutClaim(claim store.Claim) {
+	controlContext, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := worker.store.TimeoutOwnedTask(controlContext, claim.Token()); err != nil && !errors.Is(err, store.ErrLeaseLost) {
+		worker.options.Logger.Warn("task timeout finalization rejected", "task", claim.TaskID, "worker", claim.WorkerID, "lease_version", claim.LeaseVersion, "error", err)
 	}
 }
 

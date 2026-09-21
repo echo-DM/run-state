@@ -153,13 +153,15 @@ func TestFullWorkerDoesNotPrefetchBeyondLeaseDuration(t *testing.T) {
 }
 
 type taskView struct {
-	ID           string     `json:"id"`
-	Status       string     `json:"status"`
-	CurrentStep  int        `json:"current_step"`
-	LeaseVersion int64      `json:"lease_version"`
-	WorkerID     *string    `json:"worker_id"`
-	RetryAt      *time.Time `json:"retry_at"`
-	Steps        []struct {
+	ID             string     `json:"id"`
+	Status         string     `json:"status"`
+	CurrentStep    int        `json:"current_step"`
+	LeaseVersion   int64      `json:"lease_version"`
+	WorkerID       *string    `json:"worker_id"`
+	RetryAt        *time.Time `json:"retry_at"`
+	FirstStartedAt *time.Time `json:"first_started_at"`
+	DeadlineAt     *time.Time `json:"deadline_at"`
+	Steps          []struct {
 		ID             string          `json:"id"`
 		Status         string          `json:"status"`
 		Attempt        int             `json:"attempt"`
@@ -231,6 +233,7 @@ func waitForTask(t *testing.T, baseURL, taskID string, within time.Duration, rea
 	for time.Now().Before(deadline) {
 		response, err := http.Get(baseURL + "/tasks/" + taskID)
 		if err == nil {
+			latest = taskView{}
 			decodeErr := json.NewDecoder(response.Body).Decode(&latest)
 			response.Body.Close()
 			if decodeErr == nil && response.StatusCode == http.StatusOK && ready(latest) {

@@ -115,5 +115,9 @@ go test ./... -count=1
 - 已成功提交的 Step 不会在接管时重跑；遗留 `RUNNING` attempt 记录为 `worker_lost`。
 - 暂时业务错误和 Step timeout 在剩余预算内进入 `RETRY_WAIT`；永久错误、输出超限或预算耗尽直接失败。租约丢失、数据库错误和进程退出不作为业务重试写入。
 - `retry_at`、attempt 与错误均保存在 PostgreSQL；Scheduler 只唤醒数据库时间下已到期且仍符合资格的等待任务。
+- Task 总时限从首次 Claim 开始，`first_started_at` 与 `deadline_at` 只设置一次；之后的执行、重试等待、Worker 宕机和再次排队都消耗同一份墙钟预算，首次 Claim 前的排队不消耗。
+- 每个 Step attempt 使用 Step 时限与 Task 剩余时间中较早的 deadline。`step_timeout` 在 Task 尚未到期且有预算时重试；Task 到期原子写入 `TIMED_OUT`/`task_timeout`，不会进入或唤醒 `RETRY_WAIT`。
+- Scheduler 按取消请求、Task deadline、重试唤醒的顺序处理控制转换；多实例依靠行锁只产生一次有效终态事件。Worker 的超时收尾使用独立的短 Context，但仍必须通过 Worker/租约版本 fencing。
 - 对支持幂等键的外部工具，Worker 崩溃、普通重试或响应丢失后会复用原 key/input，从工具端取得已保存结果。测试用 fake tool 的 ledger 与 Worker 内存生命周期独立。
 - 这保证 durable execution、at-least-once Step execution 与 stale-worker fencing；只对支持幂等键且遵守相同 payload 契约的工具验证去重。Runtime 本地唯一约束或跳过已成功 Step 都不等于通用 exactly-once；非幂等外部副作用不作去重承诺。
+- Timeout 依赖执行器协作响应 `context.Context`；Runtime 不强制终止忽略 Context 的任意代码，也不承诺超时能撤回已经发生的外部副作用。审批等待的 deadline 行为由审批功能票验收。

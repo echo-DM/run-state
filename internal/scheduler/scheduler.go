@@ -31,15 +31,15 @@ func New(database *store.Store, options Options) *Scheduler {
 func (scheduler *Scheduler) Run(ctx context.Context) error {
 	for ctx.Err() == nil {
 		for ctx.Err() == nil {
-			woke, err := scheduler.store.WakeDueRetry(ctx)
+			processed, err := scheduler.store.ProcessDueControl(ctx)
 			if err != nil {
-				scheduler.options.Logger.Error("retry scan failed", "error", err)
+				scheduler.options.Logger.Error("control scan failed", "error", err)
 				break
 			}
-			if !woke {
+			if !processed {
 				break
 			}
-			scheduler.options.Logger.Info("retry ready")
+			scheduler.options.Logger.Info("due task processed")
 		}
 		wait(ctx, scheduler.options.PollInterval)
 	}

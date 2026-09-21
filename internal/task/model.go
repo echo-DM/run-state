@@ -11,6 +11,8 @@ const (
 	StatusRetryWait = "RETRY_WAIT"
 	StatusSucceeded = "SUCCEEDED"
 	StatusFailed    = "FAILED"
+	StatusCancelled = "CANCELLED"
+	StatusTimedOut  = "TIMED_OUT"
 
 	StepPending   = "PENDING"
 	StepRunning   = "RUNNING"

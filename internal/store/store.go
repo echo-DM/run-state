@@ -33,6 +33,7 @@ type LeaseToken struct {
 type Claim struct {
 	LeaseToken
 	LeaseExpiresAt time.Time
+	DeadlineAt     time.Time
 }
 
 func (claim Claim) Token() LeaseToken {
@@ -239,12 +240,12 @@ func (s *Store) ClaimTask(ctx context.Context, workerID string) (Claim, error) {
 		    worker_id = $2,
 		    lease_version = lease_version + 1,
 		    lease_expires_at = clock_timestamp() + ($3 * interval '1 microsecond'),
-		    first_started_at = COALESCE(first_started_at, clock_timestamp()),
-		    deadline_at = COALESCE(deadline_at, clock_timestamp() + (task_timeout_seconds * interval '1 second')),
+		    first_started_at = COALESCE(first_started_at, statement_timestamp()),
+		    deadline_at = COALESCE(deadline_at, statement_timestamp() + (task_timeout_seconds * interval '1 second')),
 		    updated_at = clock_timestamp()
 		WHERE id = $1
-		RETURNING lease_version, lease_expires_at`, taskID, workerID, leaseMicroseconds,
-	).Scan(&claim.LeaseVersion, &claim.LeaseExpiresAt)
+		RETURNING lease_version, lease_expires_at, deadline_at`, taskID, workerID, leaseMicroseconds,
+	).Scan(&claim.LeaseVersion, &claim.LeaseExpiresAt, &claim.DeadlineAt)
 	if err != nil {
 		return Claim{}, fmt.Errorf("assign lease: %w", err)
 	}
@@ -268,6 +269,17 @@ func (s *Store) ClaimTask(ctx context.Context, workerID string) (Claim, error) {
 }
 
 var errRecoveryExhausted = errors.New("recovery attempt budget exhausted")
+
+type controlOutcome struct {
+	status    string
+	reason    string
+	eventType string
+}
+
+var (
+	cancelledOutcome = controlOutcome{status: task.StatusCancelled, reason: "user_cancelled", eventType: "TASK_CANCELLED"}
+	timedOutOutcome  = controlOutcome{status: task.StatusTimedOut, reason: "task_timeout", eventType: "TASK_TIMED_OUT"}
+)
 
 func (s *Store) recoverExpiredTask(ctx context.Context, tx pgx.Tx, taskID string, currentStep int, previousWorkerID *string, previousVersion int64) error {
 	payload, _ := json.Marshal(map[string]any{
@@ -597,6 +609,135 @@ func (s *Store) FinishStep(ctx context.Context, lease LeaseToken, attempt StepAt
 	})
 }
 
+// TimeoutOwnedTask lets the current fenced owner persist the task deadline
+// transition using a control context that is independent of execution.
+func (s *Store) TimeoutOwnedTask(ctx context.Context, lease LeaseToken) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin owned timeout: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if err := setTransactionLimits(ctx, tx); err != nil {
+		return err
+	}
+	locked, err := lockTask(ctx, tx, lease.TaskID)
+	if err != nil {
+		return err
+	}
+	if locked.status == task.StatusTimedOut {
+		return nil
+	}
+	if locked.status != task.StatusRunning || locked.workerID == nil || *locked.workerID != lease.WorkerID || locked.leaseVersion != lease.LeaseVersion || locked.leaseExpiresAt == nil || !locked.leaseExpiresAt.After(locked.databaseNow) {
+		return ErrLeaseLost
+	}
+	if locked.cancelRequested {
+		return ErrCancelled
+	}
+	if locked.deadlineAt == nil || locked.deadlineAt.After(locked.databaseNow) {
+		return ErrConflict
+	}
+	if err := finishControlledTask(ctx, tx, lease.TaskID, locked.currentStep, timedOutOutcome); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit owned timeout: %w", err)
+	}
+	return nil
+}
+
+// ProcessDueControl performs one scheduler transition. Candidate ordering is
+// cancellation, task deadline, then retry wake-up.
+func (s *Store) ProcessDueControl(ctx context.Context) (bool, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false, fmt.Errorf("begin due control: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if err := setTransactionLimits(ctx, tx); err != nil {
+		return false, err
+	}
+	var taskID, status string
+	var currentStep int
+	var cancelRequested, deadlineDue, retryDue bool
+	err = tx.QueryRow(ctx, `
+		SELECT id, status, current_step, cancel_requested,
+		       deadline_at IS NOT NULL AND deadline_at <= clock_timestamp(),
+		       status = 'RETRY_WAIT' AND retry_at <= clock_timestamp()
+		FROM tasks
+		WHERE status NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT')
+		  AND (cancel_requested
+		       OR (deadline_at IS NOT NULL AND deadline_at <= clock_timestamp())
+		       OR (status = 'RETRY_WAIT' AND retry_at <= clock_timestamp()))
+		ORDER BY CASE
+			WHEN cancel_requested THEN 0
+			WHEN deadline_at IS NOT NULL AND deadline_at <= clock_timestamp() THEN 1
+			ELSE 2
+		END, COALESCE(deadline_at, retry_at), id
+		FOR UPDATE SKIP LOCKED LIMIT 1`,
+	).Scan(&taskID, &status, &currentStep, &cancelRequested, &deadlineDue, &retryDue)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("select due control: %w", err)
+	}
+	switch {
+	case cancelRequested:
+		if err := finishControlledTask(ctx, tx, taskID, currentStep, cancelledOutcome); err != nil {
+			return false, err
+		}
+	case deadlineDue:
+		if err := finishControlledTask(ctx, tx, taskID, currentStep, timedOutOutcome); err != nil {
+			return false, err
+		}
+	case retryDue && status == task.StatusRetryWait:
+		if err := wakeRetryTask(ctx, tx, taskID); err != nil {
+			return false, err
+		}
+	default:
+		return false, ErrConflict
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("commit due control: %w", err)
+	}
+	return true, nil
+}
+
+func finishControlledTask(ctx context.Context, tx pgx.Tx, taskID string, currentStep int, outcome controlOutcome) error {
+	var stepID, stepStatus string
+	var attempt int
+	err := tx.QueryRow(ctx, `
+		SELECT id, status, attempt FROM task_steps
+		WHERE task_id = $1 AND step_index = $2 FOR UPDATE`, taskID, currentStep,
+	).Scan(&stepID, &stepStatus, &attempt)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("lock controlled step: %w", err)
+	}
+	if err == nil && stepStatus != task.StepSucceeded {
+		if _, err := tx.Exec(ctx, `
+			UPDATE task_steps SET status = 'FAILED', output = NULL, error = $3,
+			finished_at = clock_timestamp() WHERE task_id = $1 AND id = $2`, taskID, stepID, outcome.reason); err != nil {
+			return fmt.Errorf("finish controlled step: %w", err)
+		}
+		payload, _ := json.Marshal(map[string]any{
+			"step_id": stepID, "step_index": currentStep, "attempt": attempt, "error": outcome.reason,
+		})
+		if _, err := tx.Exec(ctx, `INSERT INTO task_events (task_id, event_type, payload) VALUES ($1, 'STEP_FAILED', $2)`, taskID, payload); err != nil {
+			return fmt.Errorf("insert controlled step event: %w", err)
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE tasks SET status = $2, retry_at = NULL, worker_id = NULL,
+		lease_expires_at = NULL, updated_at = clock_timestamp() WHERE id = $1`, taskID, outcome.status); err != nil {
+		return fmt.Errorf("finish controlled task: %w", err)
+	}
+	payload, _ := json.Marshal(map[string]any{"step_index": currentStep, "error": outcome.reason})
+	if _, err := tx.Exec(ctx, `INSERT INTO task_events (task_id, event_type, payload) VALUES ($1, $2, $3)`, taskID, outcome.eventType, payload); err != nil {
+		return fmt.Errorf("insert %s event: %w", outcome.eventType, err)
+	}
+	return nil
+}
+
 func (s *Store) WakeDueRetry(ctx context.Context) (bool, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -620,18 +761,25 @@ func (s *Store) WakeDueRetry(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("select due retry: %w", err)
 	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE tasks SET status = 'RUNNABLE', retry_at = NULL, updated_at = clock_timestamp()
-		WHERE id = $1`, taskID); err != nil {
-		return false, fmt.Errorf("wake due retry: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `INSERT INTO task_events (task_id, event_type) VALUES ($1, 'TASK_RETRY_READY')`, taskID); err != nil {
-		return false, fmt.Errorf("insert retry ready event: %w", err)
+	if err := wakeRetryTask(ctx, tx, taskID); err != nil {
+		return false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("commit retry wake: %w", err)
 	}
 	return true, nil
+}
+
+func wakeRetryTask(ctx context.Context, tx pgx.Tx, taskID string) error {
+	if _, err := tx.Exec(ctx, `
+		UPDATE tasks SET status = 'RUNNABLE', retry_at = NULL, updated_at = clock_timestamp()
+		WHERE id = $1`, taskID); err != nil {
+		return fmt.Errorf("wake due retry: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO task_events (task_id, event_type) VALUES ($1, 'TASK_RETRY_READY')`, taskID); err != nil {
+		return fmt.Errorf("insert retry ready event: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) commitWithFactCheck(ctx context.Context, tx pgx.Tx, operation string, confirm func(context.Context) (bool, error)) error {
