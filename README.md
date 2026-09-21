@@ -38,7 +38,10 @@ curl -sS -X POST http://127.0.0.1:8080/tasks \
 
 curl -sS http://127.0.0.1:8080/tasks/<task-id>
 curl -sS http://127.0.0.1:8080/tasks/<task-id>/events
+curl -sS -X POST http://127.0.0.1:8080/tasks/<task-id>/cancel
 ```
+
+取消 `RUNNABLE`、`RETRY_WAIT` 等非运行任务会在请求事务内结束为 `CANCELLED` 并返回 200；取消 `RUNNING` 任务只先持久化请求并返回 202，Worker 或 Scheduler 随后完成终态转换。重复取消已取消任务返回 200，重复请求仍在运行的任务返回 202，取消其他终态返回 409。202 只表示请求已持久化，不表示工具已经停止。
 
 `run_at`、审批步骤以及其控制接口属于后续 ticket；当前创建请求会明确拒绝这些定义。Scheduler 默认每秒扫描一次，可通过 `RUNSTATE_SCHEDULER_POLL_INTERVAL` 调整；可同时运行多个实例。
 
@@ -118,6 +121,8 @@ go test ./... -count=1
 - Task 总时限从首次 Claim 开始，`first_started_at` 与 `deadline_at` 只设置一次；之后的执行、重试等待、Worker 宕机和再次排队都消耗同一份墙钟预算，首次 Claim 前的排队不消耗。
 - 每个 Step attempt 使用 Step 时限与 Task 剩余时间中较早的 deadline。`step_timeout` 在 Task 尚未到期且有预算时重试；Task 到期原子写入 `TIMED_OUT`/`task_timeout`，不会进入或唤醒 `RETRY_WAIT`。
 - Scheduler 按取消请求、Task deadline、重试唤醒的顺序处理控制转换；多实例依靠行锁只产生一次有效终态事件。Worker 的超时收尾使用独立的短 Context，但仍必须通过 Worker/租约版本 fencing。
+- Worker 默认每秒检查持久化取消请求，并把取消传播到当前 Step/tool 的 `context.Context`；它或 Scheduler 使用独立的短控制 Context 写入 `CANCELLED`/`user_cancelled`，清理租约且不启动后续 Step。成功、取消与超时由 Task 行锁裁决，失去租约者不能写取消终态。
 - 对支持幂等键的外部工具，Worker 崩溃、普通重试或响应丢失后会复用原 key/input，从工具端取得已保存结果。测试用 fake tool 的 ledger 与 Worker 内存生命周期独立。
 - 这保证 durable execution、at-least-once Step execution 与 stale-worker fencing；只对支持幂等键且遵守相同 payload 契约的工具验证去重。Runtime 本地唯一约束或跳过已成功 Step 都不等于通用 exactly-once；非幂等外部副作用不作去重承诺。
 - Timeout 依赖执行器协作响应 `context.Context`；Runtime 不强制终止忽略 Context 的任意代码，也不承诺超时能撤回已经发生的外部副作用。审批等待的 deadline 行为由审批功能票验收。
+- Cancellation 同样是协作式的：数据库不可用或工具忽略 Context 时不承诺硬实时停止，也不能撤回已发生的外部副作用；进程退出不会被记录为用户取消。

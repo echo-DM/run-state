@@ -13,12 +13,13 @@ import (
 )
 
 type Options struct {
-	WorkerID          string
-	Concurrency       int
-	PollInterval      time.Duration
-	HeartbeatInterval time.Duration
-	Logger            *slog.Logger
-	FakeToolURL       string
+	WorkerID             string
+	Concurrency          int
+	PollInterval         time.Duration
+	HeartbeatInterval    time.Duration
+	CancellationInterval time.Duration
+	Logger               *slog.Logger
+	FakeToolURL          string
 }
 
 type Worker struct {
@@ -35,6 +36,9 @@ func New(database *store.Store, options Options) *Worker {
 	}
 	if options.HeartbeatInterval <= 0 {
 		options.HeartbeatInterval = 10 * time.Second
+	}
+	if options.CancellationInterval <= 0 {
+		options.CancellationInterval = time.Second
 	}
 	if options.Logger == nil {
 		options.Logger = slog.Default()
@@ -80,7 +84,7 @@ func (worker *Worker) runSlot(ctx context.Context) {
 func (worker *Worker) executeClaim(parent context.Context, claim store.Claim) {
 	taskContext, cancelTask := context.WithDeadline(parent, claim.DeadlineAt)
 	heartbeatDone := make(chan error, 1)
-	go worker.heartbeat(taskContext, claim.Token(), cancelTask, heartbeatDone)
+	go worker.monitorControl(taskContext, claim.Token(), cancelTask, heartbeatDone)
 	defer func() {
 		cancelTask()
 		<-heartbeatDone
@@ -140,30 +144,61 @@ func (worker *Worker) executeClaim(parent context.Context, claim store.Claim) {
 }
 
 func (worker *Worker) timeoutClaim(claim store.Claim) {
-	controlContext, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := worker.store.TimeoutOwnedTask(controlContext, claim.Token()); err != nil && !errors.Is(err, store.ErrLeaseLost) {
-		worker.options.Logger.Warn("task timeout finalization rejected", "task", claim.TaskID, "worker", claim.WorkerID, "lease_version", claim.LeaseVersion, "error", err)
+	if errors.Is(worker.finalizeControl(claim.Token(), "timeout", worker.store.TimeoutOwnedTask), store.ErrCancelled) {
+		worker.cancelClaim(claim.Token())
 	}
 }
 
-func (worker *Worker) heartbeat(ctx context.Context, lease store.LeaseToken, cancel context.CancelFunc, done chan<- error) {
-	ticker := time.NewTicker(worker.options.HeartbeatInterval)
-	defer ticker.Stop()
+func (worker *Worker) monitorControl(ctx context.Context, lease store.LeaseToken, cancel context.CancelFunc, done chan<- error) {
+	heartbeat := time.NewTicker(worker.options.HeartbeatInterval)
+	cancellation := time.NewTicker(worker.options.CancellationInterval)
+	defer heartbeat.Stop()
+	defer cancellation.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			done <- nil
 			return
-		case <-ticker.C:
+		case <-heartbeat.C:
 			if err := worker.store.RenewLease(ctx, lease); err != nil {
 				worker.options.Logger.Warn("heartbeat stopped", "task", lease.TaskID, "worker", lease.WorkerID, "lease_version", lease.LeaseVersion, "error", err)
+				if errors.Is(err, store.ErrCancelled) {
+					worker.cancelClaim(lease)
+				}
 				cancel()
 				done <- err
 				return
 			}
+		case <-cancellation.C:
+			requested, err := worker.store.CancellationRequested(ctx, lease)
+			if err != nil {
+				worker.options.Logger.Warn("control polling stopped", "task", lease.TaskID, "worker", lease.WorkerID, "lease_version", lease.LeaseVersion, "error", err)
+				cancel()
+				done <- err
+				return
+			}
+			if requested {
+				worker.cancelClaim(lease)
+				cancel()
+				done <- store.ErrCancelled
+				return
+			}
 		}
 	}
+}
+
+func (worker *Worker) cancelClaim(lease store.LeaseToken) {
+	worker.finalizeControl(lease, "cancellation", worker.store.CancelOwnedTask)
+}
+
+func (worker *Worker) finalizeControl(lease store.LeaseToken, operation string, finalize func(context.Context, store.LeaseToken) error) error {
+	controlContext, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := finalize(controlContext, lease)
+	if err != nil && !errors.Is(err, store.ErrLeaseLost) && !errors.Is(err, store.ErrCancelled) {
+		worker.options.Logger.Warn("task control finalization rejected", "operation", operation, "task", lease.TaskID, "worker", lease.WorkerID, "lease_version", lease.LeaseVersion, "error", err)
+	}
+	return err
 }
 
 func wait(ctx context.Context, duration time.Duration) {

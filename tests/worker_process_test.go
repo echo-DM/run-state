@@ -216,6 +216,7 @@ func startWorkerProcess(t *testing.T, binary, databaseURL, workerID string) (*ex
 		"RUNSTATE_LEASE_DURATION=350ms",
 		"RUNSTATE_HEARTBEAT_INTERVAL=75ms",
 		"RUNSTATE_POLL_INTERVAL=15ms",
+		"RUNSTATE_CANCELLATION_INTERVAL=25ms",
 	)
 	logs := &bytes.Buffer{}
 	command.Stdout = logs

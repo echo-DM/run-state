@@ -32,6 +32,7 @@ func main() {
 	leaseDuration := mustDuration(logger, "RUNSTATE_LEASE_DURATION", 30*time.Second)
 	heartbeatInterval := mustDuration(logger, "RUNSTATE_HEARTBEAT_INTERVAL", 10*time.Second)
 	pollInterval := mustDuration(logger, "RUNSTATE_POLL_INTERVAL", time.Second)
+	cancellationInterval := mustDuration(logger, "RUNSTATE_CANCELLATION_INTERVAL", time.Second)
 	if heartbeatInterval >= leaseDuration {
 		logger.Error("heartbeat interval must be shorter than lease duration")
 		os.Exit(2)
@@ -53,7 +54,8 @@ func main() {
 	process := runworker.New(database, runworker.Options{
 		WorkerID: *workerID, Concurrency: *concurrency, PollInterval: pollInterval,
 		HeartbeatInterval: heartbeatInterval, Logger: logger,
-		FakeToolURL: config.String("RUNSTATE_FAKE_TOOL_URL", ""),
+		CancellationInterval: cancellationInterval,
+		FakeToolURL:          config.String("RUNSTATE_FAKE_TOOL_URL", ""),
 	})
 	if err := process.Run(ctx); err != nil {
 		logger.Error("worker stopped", "error", err)

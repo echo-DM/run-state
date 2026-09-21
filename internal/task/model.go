@@ -6,13 +6,15 @@ import (
 )
 
 const (
-	StatusRunnable  = "RUNNABLE"
-	StatusRunning   = "RUNNING"
-	StatusRetryWait = "RETRY_WAIT"
-	StatusSucceeded = "SUCCEEDED"
-	StatusFailed    = "FAILED"
-	StatusCancelled = "CANCELLED"
-	StatusTimedOut  = "TIMED_OUT"
+	StatusScheduled       = "SCHEDULED"
+	StatusRunnable        = "RUNNABLE"
+	StatusRunning         = "RUNNING"
+	StatusRetryWait       = "RETRY_WAIT"
+	StatusWaitingApproval = "WAITING_APPROVAL"
+	StatusSucceeded       = "SUCCEEDED"
+	StatusFailed          = "FAILED"
+	StatusCancelled       = "CANCELLED"
+	StatusTimedOut        = "TIMED_OUT"
 
 	StepPending   = "PENDING"
 	StepRunning   = "RUNNING"

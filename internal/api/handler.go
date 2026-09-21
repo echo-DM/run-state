@@ -19,6 +19,7 @@ type taskStore interface {
 	CreateTask(ctx context.Context, definition task.Definition) (task.Task, error)
 	LoadTask(ctx context.Context, taskID string) (task.Task, error)
 	LoadEvents(ctx context.Context, taskID string) ([]task.Event, error)
+	CancelTask(ctx context.Context, taskID string) (store.CancelResult, error)
 }
 
 type Handler struct {
@@ -31,10 +32,27 @@ func New(store taskStore) http.Handler {
 	mux.HandleFunc("POST /tasks", handler.createTask)
 	mux.HandleFunc("GET /tasks/{id}", handler.getTask)
 	mux.HandleFunc("GET /tasks/{id}/events", handler.getEvents)
+	mux.HandleFunc("POST /tasks/{id}/cancel", handler.cancelTask)
 	mux.HandleFunc("GET /healthz", func(writer http.ResponseWriter, _ *http.Request) {
 		writer.WriteHeader(http.StatusNoContent)
 	})
 	return mux
+}
+
+func (handler *Handler) cancelTask(writer http.ResponseWriter, request *http.Request) {
+	result, err := handler.store.CancelTask(request.Context(), request.PathValue("id"))
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeError(writer, http.StatusNotFound, "task not found")
+	case errors.Is(err, store.ErrConflict):
+		writeError(writer, http.StatusConflict, "task is already terminal")
+	case err != nil:
+		writeError(writer, http.StatusInternalServerError, "cancel task failed")
+	case result == store.CancellationRequested:
+		writeJSON(writer, http.StatusAccepted, map[string]string{"status": "cancellation_requested"})
+	default:
+		writeJSON(writer, http.StatusOK, map[string]string{"status": "cancelled"})
+	}
 }
 
 func (handler *Handler) getEvents(writer http.ResponseWriter, request *http.Request) {

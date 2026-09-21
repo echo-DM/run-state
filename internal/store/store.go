@@ -61,6 +61,13 @@ type StepOutcome struct {
 
 type FailureClass string
 
+type CancelResult string
+
+const (
+	CancelledSynchronously CancelResult = "cancelled"
+	CancellationRequested  CancelResult = "cancellation_requested"
+)
+
 const (
 	FailurePermanent FailureClass = "permanent"
 	FailureTemporary FailureClass = "temporary"
@@ -627,7 +634,7 @@ func (s *Store) TimeoutOwnedTask(ctx context.Context, lease LeaseToken) error {
 	if locked.status == task.StatusTimedOut {
 		return nil
 	}
-	if locked.status != task.StatusRunning || locked.workerID == nil || *locked.workerID != lease.WorkerID || locked.leaseVersion != lease.LeaseVersion || locked.leaseExpiresAt == nil || !locked.leaseExpiresAt.After(locked.databaseNow) {
+	if !ownsActiveLease(locked, lease) {
 		return ErrLeaseLost
 	}
 	if locked.cancelRequested {
@@ -643,6 +650,110 @@ func (s *Store) TimeoutOwnedTask(ctx context.Context, lease LeaseToken) error {
 		return fmt.Errorf("commit owned timeout: %w", err)
 	}
 	return nil
+}
+
+// CancelTask records a running cancellation request or atomically terminates a
+// non-running task. A repeated cancellation is idempotent.
+func (s *Store) CancelTask(ctx context.Context, taskID string) (CancelResult, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return "", fmt.Errorf("begin cancellation: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if err := setTransactionLimits(ctx, tx); err != nil {
+		return "", err
+	}
+	locked, err := lockTask(ctx, tx, taskID)
+	if err != nil {
+		return "", err
+	}
+	if locked.status == task.StatusCancelled {
+		return CancelledSynchronously, nil
+	}
+	if isTerminalStatus(locked.status) {
+		return "", ErrConflict
+	}
+	if locked.status == task.StatusRunning {
+		if _, err := tx.Exec(ctx, `UPDATE tasks SET cancel_requested = true, updated_at = clock_timestamp() WHERE id = $1`, taskID); err != nil {
+			return "", fmt.Errorf("record cancellation request: %w", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return "", fmt.Errorf("commit cancellation request: %w", err)
+		}
+		return CancellationRequested, nil
+	}
+	if err := finishControlledTask(ctx, tx, taskID, locked.currentStep, cancelledOutcome); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", fmt.Errorf("commit synchronous cancellation: %w", err)
+	}
+	return CancelledSynchronously, nil
+}
+
+// CancelOwnedTask lets the currently fenced owner turn its persisted request
+// into the terminal cancellation using an execution-independent context.
+func (s *Store) CancelOwnedTask(ctx context.Context, lease LeaseToken) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin owned cancellation: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if err := setTransactionLimits(ctx, tx); err != nil {
+		return err
+	}
+	locked, err := lockTask(ctx, tx, lease.TaskID)
+	if err != nil {
+		return err
+	}
+	if locked.status == task.StatusCancelled {
+		return nil
+	}
+	if !ownsActiveLease(locked, lease) {
+		return ErrLeaseLost
+	}
+	if !locked.cancelRequested {
+		return ErrConflict
+	}
+	if err := finishControlledTask(ctx, tx, lease.TaskID, locked.currentStep, cancelledOutcome); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit owned cancellation: %w", err)
+	}
+	return nil
+}
+
+// CancellationRequested checks the current owner's durable control state
+// without renewing its lease.
+func (s *Store) CancellationRequested(ctx context.Context, lease LeaseToken) (bool, error) {
+	var locked lockedTask
+	err := s.pool.QueryRow(ctx, `
+		SELECT status, worker_id, lease_version, lease_expires_at, cancel_requested,
+		       deadline_at, clock_timestamp(), current_step, checkpoint
+		FROM tasks WHERE id = $1`, lease.TaskID,
+	).Scan(&locked.status, &locked.workerID, &locked.leaseVersion, &locked.leaseExpiresAt,
+		&locked.cancelRequested, &locked.deadlineAt, &locked.databaseNow, &locked.currentStep,
+		&locked.checkpoint)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, ErrNotFound
+	}
+	if err != nil {
+		return false, fmt.Errorf("check cancellation: %w", err)
+	}
+	if !ownsActiveLease(locked, lease) {
+		return false, ErrLeaseLost
+	}
+	return locked.cancelRequested, nil
+}
+
+func isTerminalStatus(status string) bool {
+	switch status {
+	case task.StatusSucceeded, task.StatusFailed, task.StatusCancelled, task.StatusTimedOut:
+		return true
+	default:
+		return false
+	}
 }
 
 // ProcessDueControl performs one scheduler transition. Candidate ordering is
@@ -905,7 +1016,7 @@ func lockOwnedTask(ctx context.Context, tx pgx.Tx, lease LeaseToken) (lockedTask
 }
 
 func validateOwnership(locked lockedTask, lease LeaseToken) error {
-	if locked.status != task.StatusRunning || locked.workerID == nil || *locked.workerID != lease.WorkerID || locked.leaseVersion != lease.LeaseVersion || locked.leaseExpiresAt == nil || !locked.leaseExpiresAt.After(locked.databaseNow) {
+	if !ownsActiveLease(locked, lease) {
 		return ErrLeaseLost
 	}
 	if locked.cancelRequested {
@@ -915,6 +1026,11 @@ func validateOwnership(locked lockedTask, lease LeaseToken) error {
 		return ErrDeadlineExceeded
 	}
 	return nil
+}
+
+func ownsActiveLease(locked lockedTask, lease LeaseToken) bool {
+	return locked.status == task.StatusRunning && locked.workerID != nil && *locked.workerID == lease.WorkerID &&
+		locked.leaseVersion == lease.LeaseVersion && locked.leaseExpiresAt != nil && locked.leaseExpiresAt.After(locked.databaseNow)
 }
 
 func insertFinishEvents(ctx context.Context, tx pgx.Tx, lease LeaseToken, attempt StepAttempt, stepEvent, stepError string, taskTerminal bool) error {
