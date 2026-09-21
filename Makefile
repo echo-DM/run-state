@@ -23,7 +23,8 @@ build:
 	go build -o bin/runstate-api ./cmd/api
 	go build -o bin/runstate-worker ./cmd/worker
 	go build -o bin/runstate-scheduler ./cmd/scheduler
+	go build -o bin/runstate-fake-tool ./cmd/fake-tool
 	go build -o bin/runstate-migrate ./cmd/migrate
 
 test: db-up build
-	RUNSTATE_TEST_DATABASE_URL='$(TEST_DATABASE_URL)' RUNSTATE_WORKER_BINARY='$(CURDIR)/bin/runstate-worker' RUNSTATE_SCHEDULER_BINARY='$(CURDIR)/bin/runstate-scheduler' go test ./... -count=1
+	RUNSTATE_TEST_DATABASE_URL='$(TEST_DATABASE_URL)' RUNSTATE_WORKER_BINARY='$(CURDIR)/bin/runstate-worker' RUNSTATE_SCHEDULER_BINARY='$(CURDIR)/bin/runstate-scheduler' RUNSTATE_FAKE_TOOL_BINARY='$(CURDIR)/bin/runstate-fake-tool' go test ./... -count=1

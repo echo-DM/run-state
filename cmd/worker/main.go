@@ -53,6 +53,7 @@ func main() {
 	process := runworker.New(database, runworker.Options{
 		WorkerID: *workerID, Concurrency: *concurrency, PollInterval: pollInterval,
 		HeartbeatInterval: heartbeatInterval, Logger: logger,
+		FakeToolURL: config.String("RUNSTATE_FAKE_TOOL_URL", ""),
 	})
 	if err := process.Run(ctx); err != nil {
 		logger.Error("worker stopped", "error", err)

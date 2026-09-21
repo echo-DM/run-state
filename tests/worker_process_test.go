@@ -160,10 +160,12 @@ type taskView struct {
 	WorkerID     *string    `json:"worker_id"`
 	RetryAt      *time.Time `json:"retry_at"`
 	Steps        []struct {
+		ID             string          `json:"id"`
 		Status         string          `json:"status"`
 		Attempt        int             `json:"attempt"`
 		IdempotencyKey string          `json:"idempotency_key"`
 		ResolvedInput  json.RawMessage `json:"resolved_input"`
+		Output         json.RawMessage `json:"output"`
 		Error          *string         `json:"error"`
 	} `json:"steps"`
 }

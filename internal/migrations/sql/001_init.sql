@@ -49,6 +49,17 @@ CREATE TABLE IF NOT EXISTS task_events (
     created_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
+-- The fake tool is a separate service. Its table models an external provider's
+-- durable idempotency ledger and is intentionally not written by Runtime code.
+CREATE TABLE IF NOT EXISTS fake_tool_effects (
+    idempotency_key text PRIMARY KEY CHECK (idempotency_key <> ''),
+    payload jsonb NOT NULL,
+    result jsonb NOT NULL,
+    effect_count integer NOT NULL DEFAULT 1 CHECK (effect_count = 1),
+    request_count integer NOT NULL DEFAULT 1 CHECK (request_count > 0),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
 CREATE INDEX IF NOT EXISTS tasks_runnable_idx ON tasks (run_at, created_at) WHERE status = 'RUNNABLE';
 CREATE INDEX IF NOT EXISTS tasks_lease_idx ON tasks (lease_expires_at, created_at) WHERE status = 'RUNNING';
 CREATE INDEX IF NOT EXISTS tasks_retry_idx ON tasks (retry_at) WHERE status = 'RETRY_WAIT';

@@ -1,6 +1,6 @@
 # runState
 
-runState 是一个用 Go 和 PostgreSQL 实现的固定步骤 durable task runtime。当前支持通过 HTTP 创建与查询立即执行的 `echo` / `sleep` / `flaky` 步骤，多个 Worker 以数据库租约竞争任务，并由独立 Scheduler 持久唤醒暂时失败的步骤。
+runState 是一个用 Go 和 PostgreSQL 实现的固定步骤 durable task runtime。当前支持通过 HTTP 创建与查询立即执行的 `echo` / `sleep` / `flaky` / `fake_tool` 步骤，多个 Worker 以数据库租约竞争任务，并由独立 Scheduler 持久唤醒暂时失败的步骤。
 
 ## 本地启动
 
@@ -18,6 +18,7 @@ go run ./cmd/api
 go run ./cmd/worker --id worker-a --concurrency 1
 go run ./cmd/worker --id worker-b --concurrency 1
 go run ./cmd/scheduler
+go run ./cmd/fake-tool
 ```
 
 默认开发连接是：
@@ -48,6 +49,12 @@ curl -sS http://127.0.0.1:8080/tasks/<task-id>/events
 ```
 
 Step 默认最多执行 3 次，包含首次执行。第 n 次暂时失败后持久等待 `min(2^(n-1), 60)` 秒；等待时释放 Worker 租约，Scheduler 到期后恢复同一步。永久错误或预算耗尽会明确结束为 `FAILED`。
+
+`fake_tool` 是独立于 Worker 生命周期的 HTTP 服务，默认监听 `127.0.0.1:8090`。Worker 通过 `RUNSTATE_FAKE_TOOL_URL` 调用它，并发送 Step 的稳定 `idempotency_key` 与已持久化的 `resolved_input`。fake tool 在独立 ledger 中原子保存请求、副作用和结果：相同 key/payload 返回原结果，并发调用也只产生一次副作用；相同 key/不同 payload 返回冲突。
+
+```json
+{"steps":[{"type":"fake_tool","input":{"value":"charge once"}}]}
+```
 
 后续步骤可在允许任意 JSON 值的字段中使用只含一个字段的引用对象，首次 `StartStep` 会从同一事务中已提交的事实生成并保存 `resolved_input`：
 
@@ -95,6 +102,7 @@ make db-up
 make build
 RUNSTATE_TEST_DATABASE_URL='postgres://runstate:runstate@127.0.0.1:54329/runstate_test?sslmode=disable' \
 RUNSTATE_WORKER_BINARY="$PWD/bin/runstate-worker" \
+RUNSTATE_FAKE_TOOL_BINARY="$PWD/bin/runstate-fake-tool" \
 go test ./... -count=1
 ```
 
@@ -107,4 +115,5 @@ go test ./... -count=1
 - 已成功提交的 Step 不会在接管时重跑；遗留 `RUNNING` attempt 记录为 `worker_lost`。
 - 暂时业务错误和 Step timeout 在剩余预算内进入 `RETRY_WAIT`；永久错误、输出超限或预算耗尽直接失败。租约丢失、数据库错误和进程退出不作为业务重试写入。
 - `retry_at`、attempt 与错误均保存在 PostgreSQL；Scheduler 只唤醒数据库时间下已到期且仍符合资格的等待任务。
-- 这保证 durable execution 与 stale-worker fencing，不承诺任意外部副作用 exactly-once。
+- 对支持幂等键的外部工具，Worker 崩溃、普通重试或响应丢失后会复用原 key/input，从工具端取得已保存结果。测试用 fake tool 的 ledger 与 Worker 内存生命周期独立。
+- 这保证 durable execution、at-least-once Step execution 与 stale-worker fencing；只对支持幂等键且遵守相同 payload 契约的工具验证去重。Runtime 本地唯一约束或跳过已成功 Step 都不等于通用 exactly-once；非幂等外部副作用不作去重承诺。

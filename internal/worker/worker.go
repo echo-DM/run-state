@@ -18,6 +18,7 @@ type Options struct {
 	PollInterval      time.Duration
 	HeartbeatInterval time.Duration
 	Logger            *slog.Logger
+	FakeToolURL       string
 }
 
 type Worker struct {
@@ -103,7 +104,7 @@ func (worker *Worker) executeClaim(parent context.Context, claim store.Claim) {
 		worker.options.Logger.Info("step started", "task", claim.TaskID, "step", step.ID, "worker", claim.WorkerID, "lease_version", claim.LeaseVersion, "attempt", attempt.Attempt)
 
 		stepContext, cancelStep := context.WithTimeout(taskContext, time.Duration(attempt.TimeoutSeconds)*time.Second)
-		output, checkpoint, executeErr := executor.Execute(stepContext, attempt)
+		output, checkpoint, executeErr := executor.Execute(stepContext, attempt, executor.Options{FakeToolURL: worker.options.FakeToolURL})
 		cancelStep()
 		if taskContext.Err() != nil {
 			return
