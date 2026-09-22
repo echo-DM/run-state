@@ -162,13 +162,16 @@ type taskView struct {
 	FirstStartedAt *time.Time `json:"first_started_at"`
 	DeadlineAt     *time.Time `json:"deadline_at"`
 	Steps          []struct {
-		ID             string          `json:"id"`
-		Status         string          `json:"status"`
-		Attempt        int             `json:"attempt"`
-		IdempotencyKey string          `json:"idempotency_key"`
-		ResolvedInput  json.RawMessage `json:"resolved_input"`
-		Output         json.RawMessage `json:"output"`
-		Error          *string         `json:"error"`
+		ID               string          `json:"id"`
+		Status           string          `json:"status"`
+		Attempt          int             `json:"attempt"`
+		IdempotencyKey   string          `json:"idempotency_key"`
+		ResolvedInput    json.RawMessage `json:"resolved_input"`
+		Output           json.RawMessage `json:"output"`
+		Error            *string         `json:"error"`
+		ApprovalDecision *string         `json:"approval_decision"`
+		StartedAt        *time.Time      `json:"started_at"`
+		FinishedAt       *time.Time      `json:"finished_at"`
 	} `json:"steps"`
 }
 

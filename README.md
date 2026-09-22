@@ -1,6 +1,6 @@
 # runState
 
-runState 是一个用 Go 和 PostgreSQL 实现的固定步骤 durable task runtime。当前支持通过 HTTP 创建与查询立即执行的 `echo` / `sleep` / `flaky` / `fake_tool` 步骤，多个 Worker 以数据库租约竞争任务，并由独立 Scheduler 持久唤醒暂时失败的步骤。
+runState 是一个用 Go 和 PostgreSQL 实现的固定步骤 durable task runtime。当前支持通过 HTTP 创建与查询立即执行的 `echo` / `sleep` / `flaky` / `fake_tool` / `approval` 步骤，多个 Worker 以数据库租约竞争任务，并由独立 Scheduler 持久唤醒暂时失败或等待超时的任务。
 
 ## 本地启动
 
@@ -43,7 +43,21 @@ curl -sS -X POST http://127.0.0.1:8080/tasks/<task-id>/cancel
 
 取消 `RUNNABLE`、`RETRY_WAIT` 等非运行任务会在请求事务内结束为 `CANCELLED` 并返回 200；取消 `RUNNING` 任务只先持久化请求并返回 202，Worker 或 Scheduler 随后完成终态转换。重复取消已取消任务返回 200，重复请求仍在运行的任务返回 202，取消其他终态返回 409。202 只表示请求已持久化，不表示工具已经停止。
 
-`run_at`、审批步骤以及其控制接口属于后续 ticket；当前创建请求会明确拒绝这些定义。Scheduler 默认每秒扫描一次，可通过 `RUNSTATE_SCHEDULER_POLL_INTERVAL` 调整；可同时运行多个实例。
+审批是固定 Workflow 中的控制步骤，不运行工具、不增加 attempt，也不占用 Worker 执行槽。Worker 到达 approval step 后会把 Step 和 Task 持久化为 `WAITING_APPROVAL` 并释放租约；进程重启后仍等待同一个 `step_id`。审批等待只受 Task deadline 限制。使用当前待审批 Step 的 ID 作出决定：
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/tasks/<task-id>/approve \
+  -H 'content-type: application/json' \
+  -d '{"step_id":"<step-id>"}'
+
+curl -sS -X POST http://127.0.0.1:8080/tasks/<task-id>/reject \
+  -H 'content-type: application/json' \
+  -d '{"step_id":"<step-id>"}'
+```
+
+批准会记录决定并推进到下一 Step；批准最后一步会直接结束为 `SUCCEEDED`。拒绝会以 `approval_rejected` 结束为 `FAILED`。相同 Step 的同一决定重放返回 200，包括原决定和当前 Task 状态，不会重复推进或写事件；相反决定、迟到决定或非当前 Step 返回 409，Task/Step 不存在返回 404，请求缺少 `step_id` 或 JSON 非法返回 400。取消审批等待会立即结束为 `CANCELLED`，Task deadline 到期由 Scheduler 结束为 `TIMED_OUT`。
+
+`run_at` 仍属于后续 ticket；当前创建请求会明确拒绝定时任务定义。Scheduler 默认每秒扫描一次，可通过 `RUNSTATE_SCHEDULER_POLL_INTERVAL` 调整；可同时运行多个实例。
 
 `flaky` 是用于故障验收的可控执行器。`temporary_failures` 表示成功前暂时失败的次数，`permanent` 表示立即返回永久错误，两者不能同时生效：
 

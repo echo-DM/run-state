@@ -16,10 +16,13 @@ const (
 	StatusCancelled       = "CANCELLED"
 	StatusTimedOut        = "TIMED_OUT"
 
-	StepPending   = "PENDING"
-	StepRunning   = "RUNNING"
-	StepSucceeded = "SUCCEEDED"
-	StepFailed    = "FAILED"
+	StepTypeApproval = "approval"
+
+	StepPending         = "PENDING"
+	StepRunning         = "RUNNING"
+	StepWaitingApproval = "WAITING_APPROVAL"
+	StepSucceeded       = "SUCCEEDED"
+	StepFailed          = "FAILED"
 )
 
 type Definition struct {
@@ -56,21 +59,22 @@ type Task struct {
 }
 
 type Step struct {
-	ID             string          `json:"id"`
-	TaskID         string          `json:"task_id"`
-	Index          int             `json:"index"`
-	Type           string          `json:"type"`
-	Status         string          `json:"status"`
-	Attempt        int             `json:"attempt"`
-	MaxAttempts    int             `json:"max_attempts"`
-	IdempotencyKey string          `json:"idempotency_key"`
-	Input          json.RawMessage `json:"input"`
-	ResolvedInput  json.RawMessage `json:"resolved_input,omitempty"`
-	Output         json.RawMessage `json:"output,omitempty"`
-	Error          *string         `json:"error,omitempty"`
-	TimeoutSeconds int             `json:"timeout_seconds"`
-	StartedAt      *time.Time      `json:"started_at,omitempty"`
-	FinishedAt     *time.Time      `json:"finished_at,omitempty"`
+	ID               string          `json:"id"`
+	TaskID           string          `json:"task_id"`
+	Index            int             `json:"index"`
+	Type             string          `json:"type"`
+	Status           string          `json:"status"`
+	Attempt          int             `json:"attempt"`
+	MaxAttempts      int             `json:"max_attempts"`
+	IdempotencyKey   string          `json:"idempotency_key"`
+	Input            json.RawMessage `json:"input"`
+	ResolvedInput    json.RawMessage `json:"resolved_input,omitempty"`
+	Output           json.RawMessage `json:"output,omitempty"`
+	Error            *string         `json:"error,omitempty"`
+	ApprovalDecision *string         `json:"approval_decision,omitempty"`
+	TimeoutSeconds   int             `json:"timeout_seconds"`
+	StartedAt        *time.Time      `json:"started_at,omitempty"`
+	FinishedAt       *time.Time      `json:"finished_at,omitempty"`
 }
 
 type Event struct {

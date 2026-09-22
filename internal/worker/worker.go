@@ -100,6 +100,18 @@ func (worker *Worker) executeClaim(parent context.Context, claim store.Claim) {
 			return
 		}
 		step := loaded.Steps[loaded.CurrentStep]
+		if step.Type == task.StepTypeApproval {
+			err := worker.store.WaitForApproval(taskContext, claim.Token(), step.ID)
+			switch {
+			case errors.Is(err, store.ErrCancelled):
+				worker.cancelClaim(claim.Token())
+			case errors.Is(err, store.ErrDeadlineExceeded), errors.Is(taskContext.Err(), context.DeadlineExceeded):
+				worker.timeoutClaim(claim)
+			case err != nil && taskContext.Err() == nil:
+				worker.options.Logger.Warn("approval wait rejected", "task", claim.TaskID, "step", step.ID, "worker", claim.WorkerID, "lease_version", claim.LeaseVersion, "error", err)
+			}
+			return
+		}
 		attempt, err := worker.store.StartStep(taskContext, claim.Token(), step.ID)
 		if err != nil {
 			worker.options.Logger.Warn("start step rejected", "task", claim.TaskID, "step", step.ID, "worker", claim.WorkerID, "lease_version", claim.LeaseVersion, "error", err)

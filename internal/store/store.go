@@ -63,6 +63,11 @@ type FailureClass string
 
 type CancelResult string
 
+type ApprovalResult struct {
+	Decision   string `json:"decision"`
+	TaskStatus string `json:"task_status"`
+}
+
 const (
 	CancelledSynchronously CancelResult = "cancelled"
 	CancellationRequested  CancelResult = "cancellation_requested"
@@ -168,7 +173,7 @@ func (s *Store) LoadTask(ctx context.Context, taskID string) (task.Task, error) 
 
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, task_id, step_index, step_type, status, attempt, max_attempts,
-		       idempotency_key, input, resolved_input, output, error,
+		       idempotency_key, input, resolved_input, output, error, approval_decision,
 		       timeout_seconds, started_at, finished_at
 		FROM task_steps WHERE task_id = $1 ORDER BY step_index`, taskID)
 	if err != nil {
@@ -179,7 +184,7 @@ func (s *Store) LoadTask(ctx context.Context, taskID string) (task.Task, error) 
 		var step task.Step
 		if err := rows.Scan(&step.ID, &step.TaskID, &step.Index, &step.Type, &step.Status,
 			&step.Attempt, &step.MaxAttempts, &step.IdempotencyKey, &step.Input,
-			&step.ResolvedInput, &step.Output, &step.Error, &step.TimeoutSeconds,
+			&step.ResolvedInput, &step.Output, &step.Error, &step.ApprovalDecision, &step.TimeoutSeconds,
 			&step.StartedAt, &step.FinishedAt); err != nil {
 			return task.Task{}, fmt.Errorf("scan task step: %w", err)
 		}
@@ -432,6 +437,9 @@ func (s *Store) StartStep(ctx context.Context, lease LeaseToken, stepID string) 
 		return StepAttempt{}, fmt.Errorf("lock step: %w", err)
 	}
 
+	if attempt.StepType == task.StepTypeApproval {
+		return StepAttempt{}, ErrConflict
+	}
 	if attempt.StepIndex != locked.currentStep || (status != task.StepPending && status != task.StepFailed) || attempt.Attempt >= attempt.MaxAttempts {
 		return StepAttempt{}, ErrConflict
 	}
@@ -490,6 +498,250 @@ func (s *Store) StartStep(ctx context.Context, lease LeaseToken, stepID string) 
 		return StepAttempt{}, err
 	}
 	return attempt, nil
+}
+
+// WaitForApproval persists the current approval step and releases the worker's
+// lease in one transaction. Approval is a control step and does not consume an
+// execution attempt.
+func (s *Store) WaitForApproval(ctx context.Context, lease LeaseToken, stepID string) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin approval wait: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if err := setTransactionLimits(ctx, tx); err != nil {
+		return err
+	}
+	locked, err := lockOwnedTask(ctx, tx, lease)
+	if err != nil {
+		return err
+	}
+
+	var stepIndex, attempt int
+	var stepType, status string
+	var configuredInput, persistedResolvedInput json.RawMessage
+	err = tx.QueryRow(ctx, `
+		SELECT step_index, step_type, status, attempt, input, resolved_input
+		FROM task_steps WHERE task_id = $1 AND id = $2 FOR UPDATE`, lease.TaskID, stepID,
+	).Scan(&stepIndex, &stepType, &status, &attempt, &configuredInput, &persistedResolvedInput)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrConflict
+	}
+	if err != nil {
+		return fmt.Errorf("lock approval step: %w", err)
+	}
+	if stepType != task.StepTypeApproval || stepIndex != locked.currentStep || status != task.StepPending || attempt != 0 {
+		return ErrConflict
+	}
+	var unfinishedPredecessors bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM task_steps
+			WHERE task_id = $1 AND step_index < $2 AND status <> 'SUCCEEDED'
+		)`, lease.TaskID, stepIndex).Scan(&unfinishedPredecessors); err != nil {
+		return fmt.Errorf("check approval predecessors: %w", err)
+	}
+	if unfinishedPredecessors {
+		return ErrConflict
+	}
+
+	resolvedInput := persistedResolvedInput
+	if len(resolvedInput) == 0 {
+		var previousOutput json.RawMessage
+		if stepIndex > 0 {
+			if err := tx.QueryRow(ctx, `
+				SELECT output FROM task_steps
+				WHERE task_id = $1 AND step_index = $2 AND status = 'SUCCEEDED'`,
+				lease.TaskID, stepIndex-1,
+			).Scan(&previousOutput); err != nil {
+				return fmt.Errorf("load previous step output for approval: %w", err)
+			}
+		}
+		resolvedInput, err = task.ResolveInput(configuredInput, previousOutput, locked.checkpoint)
+		if err != nil {
+			return fmt.Errorf("resolve approval input: %w", err)
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE task_steps
+		SET status = 'WAITING_APPROVAL', resolved_input = $3, error = NULL,
+		    started_at = clock_timestamp(), finished_at = NULL
+		WHERE task_id = $1 AND id = $2`, lease.TaskID, stepID, resolvedInput); err != nil {
+		return fmt.Errorf("persist approval wait: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE tasks
+		SET status = 'WAITING_APPROVAL', worker_id = NULL, lease_expires_at = NULL,
+		    retry_at = NULL, updated_at = clock_timestamp()
+		WHERE id = $1`, lease.TaskID); err != nil {
+		return fmt.Errorf("release approval task lease: %w", err)
+	}
+	payload, _ := json.Marshal(map[string]any{"step_id": stepID, "step_index": stepIndex})
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO task_events (task_id, event_type, payload)
+		VALUES ($1, 'TASK_WAITING_APPROVAL', $2)`, lease.TaskID, payload); err != nil {
+		return fmt.Errorf("insert approval wait event: %w", err)
+	}
+	return s.commitWithFactCheck(ctx, tx, "wait_approval", func(confirmCtx context.Context) (bool, error) {
+		var persisted bool
+		err := s.pool.QueryRow(confirmCtx, `
+			SELECT EXISTS (
+				SELECT 1 FROM tasks task
+				JOIN task_steps step ON step.task_id = task.id
+				WHERE task.id = $1 AND task.status = 'WAITING_APPROVAL'
+				  AND step.id = $2 AND step.status = 'WAITING_APPROVAL'
+				  AND EXISTS (
+					SELECT 1 FROM task_events event
+					WHERE event.task_id = $1 AND event.event_type = 'TASK_WAITING_APPROVAL'
+					  AND event.payload->>'step_id' = $2
+				  )
+			)`, lease.TaskID, stepID).Scan(&persisted)
+		return persisted, err
+	})
+}
+
+// DecideApproval records one decision for the task's current waiting approval
+// step. A matching replay returns the original decision and current task state.
+func (s *Store) DecideApproval(ctx context.Context, taskID, stepID, decision string) (ApprovalResult, error) {
+	if decision != "approved" && decision != "rejected" {
+		return ApprovalResult{}, ErrConflict
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return ApprovalResult{}, fmt.Errorf("begin approval decision: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if err := setTransactionLimits(ctx, tx); err != nil {
+		return ApprovalResult{}, err
+	}
+	locked, err := lockTask(ctx, tx, taskID)
+	if err != nil {
+		return ApprovalResult{}, err
+	}
+
+	var stepIndex int
+	var stepType, stepStatus string
+	var persistedDecision *string
+	err = tx.QueryRow(ctx, `
+		SELECT step_index, step_type, status, approval_decision
+		FROM task_steps WHERE task_id = $1 AND id = $2 FOR UPDATE`, taskID, stepID,
+	).Scan(&stepIndex, &stepType, &stepStatus, &persistedDecision)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ApprovalResult{}, ErrNotFound
+	}
+	if err != nil {
+		return ApprovalResult{}, fmt.Errorf("lock approval decision step: %w", err)
+	}
+	if persistedDecision != nil {
+		if *persistedDecision != decision {
+			return ApprovalResult{}, ErrConflict
+		}
+		return ApprovalResult{Decision: *persistedDecision, TaskStatus: locked.status}, nil
+	}
+	if locked.status != task.StatusWaitingApproval || stepType != task.StepTypeApproval ||
+		stepStatus != task.StepWaitingApproval || stepIndex != locked.currentStep {
+		return ApprovalResult{}, ErrConflict
+	}
+	if locked.cancelRequested || (locked.deadlineAt != nil && !locked.deadlineAt.After(locked.databaseNow)) {
+		return ApprovalResult{}, ErrConflict
+	}
+
+	result := ApprovalResult{Decision: decision}
+	payload, _ := json.Marshal(map[string]any{"step_id": stepID, "step_index": stepIndex, "decision": decision})
+	if decision == "approved" {
+		var stepCount int
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM task_steps WHERE task_id = $1`, taskID).Scan(&stepCount); err != nil {
+			return ApprovalResult{}, fmt.Errorf("count approval task steps: %w", err)
+		}
+		nextStep := stepIndex + 1
+		result.TaskStatus = task.StatusRunnable
+		if nextStep == stepCount {
+			result.TaskStatus = task.StatusSucceeded
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE task_steps
+			SET approval_decision = 'approved', status = 'SUCCEEDED', error = NULL,
+			    finished_at = clock_timestamp()
+			WHERE task_id = $1 AND id = $2`, taskID, stepID); err != nil {
+			return ApprovalResult{}, fmt.Errorf("approve step: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE tasks
+			SET status = $2, current_step = $3, worker_id = NULL, lease_expires_at = NULL,
+			    retry_at = NULL, updated_at = clock_timestamp()
+			WHERE id = $1`, taskID, result.TaskStatus, nextStep); err != nil {
+			return ApprovalResult{}, fmt.Errorf("advance approved task: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO task_events (task_id, event_type, payload)
+			VALUES ($1, 'TASK_APPROVED', $2)`, taskID, payload); err != nil {
+			return ApprovalResult{}, fmt.Errorf("insert approval event: %w", err)
+		}
+		if result.TaskStatus == task.StatusSucceeded {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO task_events (task_id, event_type, payload)
+				VALUES ($1, 'TASK_SUCCEEDED', $2)`, taskID, payload); err != nil {
+				return ApprovalResult{}, fmt.Errorf("insert approved task success event: %w", err)
+			}
+		}
+	} else {
+		result.TaskStatus = task.StatusFailed
+		if _, err := tx.Exec(ctx, `
+			UPDATE task_steps
+			SET approval_decision = 'rejected', status = 'FAILED', error = 'approval_rejected',
+			    finished_at = clock_timestamp()
+			WHERE task_id = $1 AND id = $2`, taskID, stepID); err != nil {
+			return ApprovalResult{}, fmt.Errorf("reject step: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE tasks
+			SET status = 'FAILED', worker_id = NULL, lease_expires_at = NULL,
+			    retry_at = NULL, updated_at = clock_timestamp()
+			WHERE id = $1`, taskID); err != nil {
+			return ApprovalResult{}, fmt.Errorf("fail rejected task: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO task_events (task_id, event_type, payload)
+			VALUES ($1, 'TASK_REJECTED', $2)`, taskID, payload); err != nil {
+			return ApprovalResult{}, fmt.Errorf("insert rejection event: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO task_events (task_id, event_type, payload)
+			VALUES ($1, 'TASK_FAILED', $2)`, taskID, payload); err != nil {
+			return ApprovalResult{}, fmt.Errorf("insert rejected task failure event: %w", err)
+		}
+	}
+	stepStatus = task.StepSucceeded
+	eventType := "TASK_APPROVED"
+	if decision == "rejected" {
+		stepStatus = task.StepFailed
+		eventType = "TASK_REJECTED"
+	}
+	if err := s.commitWithFactCheck(ctx, tx, "decide_approval", func(confirmCtx context.Context) (bool, error) {
+		var persisted bool
+		err := s.pool.QueryRow(confirmCtx, `
+			SELECT EXISTS (
+				SELECT 1 FROM task_steps step
+				JOIN tasks task ON task.id = step.task_id
+				WHERE step.task_id = $1 AND step.id = $2
+				  AND step.approval_decision = $3 AND step.status = $4
+				  AND (
+					($3 = 'approved' AND task.current_step > step.step_index)
+					OR ($3 = 'rejected' AND task.status = 'FAILED' AND task.current_step = step.step_index)
+				  )
+				  AND EXISTS (
+					SELECT 1 FROM task_events event
+					WHERE event.task_id = $1 AND event.event_type = $5
+					  AND event.payload->>'step_id' = $2
+					  AND event.payload->>'decision' = $3
+				  )
+			)
+		`, taskID, stepID, decision, stepStatus, eventType).Scan(&persisted)
+		return persisted, err
+	}); err != nil {
+		return ApprovalResult{}, err
+	}
+	return result, nil
 }
 
 func (s *Store) FinishStep(ctx context.Context, lease LeaseToken, attempt StepAttempt, outcome StepOutcome) error {
@@ -990,16 +1242,18 @@ func lockTask(ctx context.Context, tx pgx.Tx, taskID string) (lockedTask, error)
 	var locked lockedTask
 	err := tx.QueryRow(ctx, `
 		SELECT status, worker_id, lease_version, lease_expires_at, cancel_requested,
-		       deadline_at, clock_timestamp(), current_step, checkpoint
+		       deadline_at, current_step, checkpoint
 		FROM tasks WHERE id = $1 FOR UPDATE`, taskID,
 	).Scan(&locked.status, &locked.workerID, &locked.leaseVersion, &locked.leaseExpiresAt,
-		&locked.cancelRequested, &locked.deadlineAt, &locked.databaseNow, &locked.currentStep,
-		&locked.checkpoint)
+		&locked.cancelRequested, &locked.deadlineAt, &locked.currentStep, &locked.checkpoint)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return lockedTask{}, ErrNotFound
 	}
 	if err != nil {
 		return lockedTask{}, fmt.Errorf("lock task: %w", err)
+	}
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&locked.databaseNow); err != nil {
+		return lockedTask{}, fmt.Errorf("read time after locking task: %w", err)
 	}
 	return locked, nil
 }

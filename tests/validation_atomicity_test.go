@@ -34,7 +34,6 @@ func TestInvalidWorkflowDefinitionsAreRejectedWithoutPersistence(t *testing.T) {
 		"empty sequence":             `{"steps":[]}`,
 		"too many steps":             `{"steps":[` + strings.Join(oneHundredOne, ",") + `]}`,
 		"unknown type":               `{"steps":[{"type":"missing","input":{}}]}`,
-		"approval not implemented":   `{"steps":[{"type":"approval","input":{}}]}`,
 		"scheduled not implemented":  `{"run_at":null,"steps":[{"type":"echo","input":{"value":1}}]}`,
 		"invalid normal input":       `{"steps":[{"type":"sleep","input":{"duration":"soon"}}]}`,
 		"first step previous output": `{"steps":[{"type":"echo","input":{"value":{"$ref":"previous_output"}}}]}`,

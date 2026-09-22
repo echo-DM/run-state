@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/dimen61/runstate/internal/executor"
 	"github.com/dimen61/runstate/internal/store"
@@ -20,6 +21,7 @@ type taskStore interface {
 	LoadTask(ctx context.Context, taskID string) (task.Task, error)
 	LoadEvents(ctx context.Context, taskID string) ([]task.Event, error)
 	CancelTask(ctx context.Context, taskID string) (store.CancelResult, error)
+	DecideApproval(ctx context.Context, taskID, stepID, decision string) (store.ApprovalResult, error)
 }
 
 type Handler struct {
@@ -33,10 +35,48 @@ func New(store taskStore) http.Handler {
 	mux.HandleFunc("GET /tasks/{id}", handler.getTask)
 	mux.HandleFunc("GET /tasks/{id}/events", handler.getEvents)
 	mux.HandleFunc("POST /tasks/{id}/cancel", handler.cancelTask)
+	mux.HandleFunc("POST /tasks/{id}/approve", func(writer http.ResponseWriter, request *http.Request) {
+		handler.decideApproval(writer, request, "approved")
+	})
+	mux.HandleFunc("POST /tasks/{id}/reject", func(writer http.ResponseWriter, request *http.Request) {
+		handler.decideApproval(writer, request, "rejected")
+	})
 	mux.HandleFunc("GET /healthz", func(writer http.ResponseWriter, _ *http.Request) {
 		writer.WriteHeader(http.StatusNoContent)
 	})
 	return mux
+}
+
+func (handler *Handler) decideApproval(writer http.ResponseWriter, request *http.Request, decision string) {
+	request.Body = http.MaxBytesReader(writer, request.Body, maxDocumentBytes)
+	decoder := json.NewDecoder(request.Body)
+	decoder.DisallowUnknownFields()
+	var input struct {
+		StepID string `json:"step_id"`
+	}
+	if err := decoder.Decode(&input); err != nil {
+		writeError(writer, http.StatusBadRequest, fmt.Sprintf("invalid request: %v", err))
+		return
+	}
+	if err := ensureEOF(decoder); err != nil {
+		writeError(writer, http.StatusBadRequest, err.Error())
+		return
+	}
+	if strings.TrimSpace(input.StepID) == "" || input.StepID != strings.TrimSpace(input.StepID) {
+		writeError(writer, http.StatusBadRequest, "step_id is required")
+		return
+	}
+	result, err := handler.store.DecideApproval(request.Context(), request.PathValue("id"), input.StepID, decision)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeError(writer, http.StatusNotFound, "task or step not found")
+	case errors.Is(err, store.ErrConflict):
+		writeError(writer, http.StatusConflict, "approval is not current or conflicts with a saved decision")
+	case err != nil:
+		writeError(writer, http.StatusInternalServerError, "decide approval failed")
+	default:
+		writeJSON(writer, http.StatusOK, result)
+	}
 }
 
 func (handler *Handler) cancelTask(writer http.ResponseWriter, request *http.Request) {
@@ -133,9 +173,6 @@ func validateDefinition(input createTaskRequest) (task.Definition, error) {
 	}
 	definition := task.Definition{TenantID: input.TenantID, TaskTimeoutSeconds: taskTimeoutSeconds}
 	for index, step := range input.Steps {
-		if step.Type == "approval" {
-			return task.Definition{}, fmt.Errorf("step %d: approval steps are not implemented", index)
-		}
 		if len(step.Input) == 0 || len(step.Input) > maxDocumentBytes || !json.Valid(step.Input) {
 			return task.Definition{}, fmt.Errorf("step %d: input must be valid JSON no larger than 1 MiB", index)
 		}
@@ -153,8 +190,10 @@ func validateDefinition(input createTaskRequest) (task.Definition, error) {
 		if maxAttempts <= 0 {
 			return task.Definition{}, fmt.Errorf("step %d: max_attempts must be positive", index)
 		}
-		if err := executor.ValidateDefinition(step.Type, step.Input); err != nil {
-			return task.Definition{}, fmt.Errorf("step %d: %w", index, err)
+		if step.Type != task.StepTypeApproval {
+			if err := executor.ValidateDefinition(step.Type, step.Input); err != nil {
+				return task.Definition{}, fmt.Errorf("step %d: %w", index, err)
+			}
 		}
 		if err := task.ValidateInputReferences(step.Input, index > 0); err != nil {
 			return task.Definition{}, fmt.Errorf("step %d: %w", index, err)
