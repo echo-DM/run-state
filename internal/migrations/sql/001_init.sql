@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS fake_tool_effects (
 );
 
 CREATE INDEX IF NOT EXISTS tasks_runnable_idx ON tasks (run_at, created_at) WHERE status = 'RUNNABLE';
+CREATE INDEX IF NOT EXISTS tasks_scheduled_idx ON tasks (run_at, id) WHERE status = 'SCHEDULED';
 CREATE INDEX IF NOT EXISTS tasks_lease_idx ON tasks (lease_expires_at, created_at) WHERE status = 'RUNNING';
 CREATE INDEX IF NOT EXISTS tasks_retry_idx ON tasks (retry_at) WHERE status = 'RETRY_WAIT';
 CREATE INDEX IF NOT EXISTS tasks_deadline_idx ON tasks (deadline_at) WHERE status NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT');

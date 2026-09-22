@@ -27,6 +27,7 @@ const (
 
 type Definition struct {
 	TenantID           *string
+	RunAt              *time.Time
 	TaskTimeoutSeconds int
 	Steps              []StepDefinition
 }

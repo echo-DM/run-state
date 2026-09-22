@@ -111,13 +111,20 @@ func (s *Store) CreateTask(ctx context.Context, definition task.Definition) (tas
 	defer tx.Rollback(ctx)
 
 	var created task.Task
+	var runAt any
+	if definition.RunAt != nil {
+		runAt = *definition.RunAt
+	}
 	err = tx.QueryRow(ctx, `
 		INSERT INTO tasks (id, tenant_id, status, run_at, task_timeout_seconds)
-		VALUES ($1, $2, 'RUNNABLE', clock_timestamp(), $3)
+		SELECT $1, $2,
+		       CASE WHEN $3::timestamptz > database_time.now THEN 'SCHEDULED' ELSE 'RUNNABLE' END,
+		       COALESCE($3::timestamptz, database_time.now), $4
+		FROM (SELECT clock_timestamp() AS now) AS database_time
 		RETURNING id, tenant_id, status, created_at, updated_at, run_at, retry_at, worker_id,
 		          lease_version, lease_expires_at, cancel_requested, current_step,
 		          checkpoint, task_timeout_seconds, first_started_at, deadline_at`,
-		taskID, definition.TenantID, definition.TaskTimeoutSeconds,
+		taskID, definition.TenantID, runAt, definition.TaskTimeoutSeconds,
 	).Scan(&created.ID, &created.TenantID, &created.Status, &created.CreatedAt, &created.UpdatedAt,
 		&created.RunAt, &created.RetryAt, &created.WorkerID, &created.LeaseVersion, &created.LeaseExpiresAt,
 		&created.CancelRequested, &created.CurrentStep, &created.Checkpoint,
@@ -146,6 +153,12 @@ func (s *Store) CreateTask(ctx context.Context, definition task.Definition) (tas
 	payload, _ := json.Marshal(map[string]any{"step_count": len(definition.Steps)})
 	if _, err := tx.Exec(ctx, `INSERT INTO task_events (task_id, event_type, payload) VALUES ($1, 'TASK_CREATED', $2)`, taskID, payload); err != nil {
 		return task.Task{}, fmt.Errorf("insert task created event: %w", err)
+	}
+	if created.Status == task.StatusScheduled {
+		scheduledPayload, _ := json.Marshal(map[string]any{"run_at": created.RunAt})
+		if _, err := tx.Exec(ctx, `INSERT INTO task_events (task_id, event_type, payload) VALUES ($1, 'TASK_SCHEDULED', $2)`, taskID, scheduledPayload); err != nil {
+			return task.Task{}, fmt.Errorf("insert task scheduled event: %w", err)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return task.Task{}, fmt.Errorf("commit create task: %w", err)
@@ -1009,7 +1022,7 @@ func isTerminalStatus(status string) bool {
 }
 
 // ProcessDueControl performs one scheduler transition. Candidate ordering is
-// cancellation, task deadline, then retry wake-up.
+// cancellation, task deadline, then scheduled or retry wake-up.
 func (s *Store) ProcessDueControl(ctx context.Context) (bool, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -1021,49 +1034,78 @@ func (s *Store) ProcessDueControl(ctx context.Context) (bool, error) {
 	}
 	var taskID, status string
 	var currentStep int
-	var cancelRequested, deadlineDue, retryDue bool
+	var cancelRequested bool
+	var deadlineAt, retryAt *time.Time
+	var runAt time.Time
 	err = tx.QueryRow(ctx, `
-		SELECT id, status, current_step, cancel_requested,
-		       deadline_at IS NOT NULL AND deadline_at <= clock_timestamp(),
-		       status = 'RETRY_WAIT' AND retry_at <= clock_timestamp()
+		SELECT id, status, current_step, cancel_requested, deadline_at, retry_at, run_at
 		FROM tasks
 		WHERE status NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT')
 		  AND (cancel_requested
 		       OR (deadline_at IS NOT NULL AND deadline_at <= clock_timestamp())
-		       OR (status = 'RETRY_WAIT' AND retry_at <= clock_timestamp()))
+		       OR (status = 'RETRY_WAIT' AND retry_at <= clock_timestamp())
+		       OR (status = 'SCHEDULED' AND run_at <= clock_timestamp()))
 		ORDER BY CASE
 			WHEN cancel_requested THEN 0
 			WHEN deadline_at IS NOT NULL AND deadline_at <= clock_timestamp() THEN 1
 			ELSE 2
-		END, COALESCE(deadline_at, retry_at), id
+		END,
+		CASE WHEN status = 'RETRY_WAIT' THEN retry_at ELSE run_at END, id
 		FOR UPDATE SKIP LOCKED LIMIT 1`,
-	).Scan(&taskID, &status, &currentStep, &cancelRequested, &deadlineDue, &retryDue)
+	).Scan(&taskID, &status, &currentStep, &cancelRequested, &deadlineAt, &retryAt, &runAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("select due control: %w", err)
 	}
+	var databaseNow time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&databaseNow); err != nil {
+		return false, fmt.Errorf("read database time after locking due task: %w", err)
+	}
 	switch {
 	case cancelRequested:
 		if err := finishControlledTask(ctx, tx, taskID, currentStep, cancelledOutcome); err != nil {
 			return false, err
 		}
-	case deadlineDue:
+	case deadlineAt != nil && !deadlineAt.After(databaseNow):
 		if err := finishControlledTask(ctx, tx, taskID, currentStep, timedOutOutcome); err != nil {
 			return false, err
 		}
-	case retryDue && status == task.StatusRetryWait:
+	case status == task.StatusRetryWait && retryAt != nil && !retryAt.After(databaseNow):
 		if err := wakeRetryTask(ctx, tx, taskID); err != nil {
 			return false, err
 		}
+	case status == task.StatusScheduled && !runAt.After(databaseNow):
+		if err := wakeScheduledTask(ctx, tx, taskID, runAt); err != nil {
+			return false, err
+		}
 	default:
-		return false, ErrConflict
+		return false, nil
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("commit due control: %w", err)
 	}
 	return true, nil
+}
+
+func wakeScheduledTask(ctx context.Context, tx pgx.Tx, taskID string, runAt time.Time) error {
+	result, err := tx.Exec(ctx, `
+		UPDATE tasks SET status = 'RUNNABLE', updated_at = clock_timestamp()
+		WHERE id = $1 AND status = 'SCHEDULED'`, taskID)
+	if err != nil {
+		return fmt.Errorf("wake scheduled task: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return ErrConflict
+	}
+	payload, _ := json.Marshal(map[string]any{"run_at": runAt, "source": "scheduled"})
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO task_events (task_id, event_type, payload)
+		VALUES ($1, 'TASK_RUNNABLE', $2)`, taskID, payload); err != nil {
+		return fmt.Errorf("insert scheduled ready event: %w", err)
+	}
+	return nil
 }
 
 func finishControlledTask(ctx context.Context, tx pgx.Tx, taskID string, currentStep int, outcome controlOutcome) error {

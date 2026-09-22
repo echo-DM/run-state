@@ -11,10 +11,12 @@ import (
 	"os"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/dimen61/runstate/internal/api"
 	"github.com/dimen61/runstate/internal/migrations"
 	"github.com/dimen61/runstate/internal/store"
+	"github.com/dimen61/runstate/internal/task"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -74,6 +76,95 @@ func TestUserCreatesAndReadsFixedTask(t *testing.T) {
 	}
 	if len(got.Steps) != 2 || got.Steps[0].Index != 0 || got.Steps[0].Type != "echo" || got.Steps[0].Status != "PENDING" || got.Steps[1].Index != 1 || got.Steps[1].Type != "sleep" || got.Steps[1].Status != "PENDING" {
 		t.Fatalf("steps = %+v, want ordered pending echo and sleep steps", got.Steps)
+	}
+}
+
+func TestUserCreatesFutureTaskWithExplicitTimezone(t *testing.T) {
+	pool := isolatedTestPool(t)
+	if err := migrations.Run(context.Background(), pool); err != nil {
+		t.Fatalf("migrate test schema: %v", err)
+	}
+	server := httptest.NewServer(api.New(store.New(pool, store.Options{})))
+	t.Cleanup(server.Close)
+
+	runAt := time.Now().UTC().Add(2 * time.Minute).In(time.FixedZone("UTC+08", 8*60*60))
+	body, err := json.Marshal(map[string]any{
+		"run_at": runAt.Format(time.RFC3339Nano),
+		"steps":  []map[string]any{{"type": "echo", "input": map[string]any{"value": "scheduled"}}},
+	})
+	if err != nil {
+		t.Fatalf("encode scheduled task: %v", err)
+	}
+	response, err := http.Post(server.URL+"/tasks", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("create scheduled task: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("create status = %d, want %d", response.StatusCode, http.StatusCreated)
+	}
+	var created task.Task
+	if err := json.NewDecoder(response.Body).Decode(&created); err != nil {
+		t.Fatalf("decode scheduled task: %v", err)
+	}
+	if created.Status != task.StatusScheduled || !created.RunAt.Equal(runAt) {
+		t.Fatalf("created task status/run_at = %s/%s, want SCHEDULED/%s", created.Status, created.RunAt, runAt)
+	}
+	if created.FirstStartedAt != nil || created.DeadlineAt != nil || created.LeaseVersion != 0 {
+		t.Fatalf("scheduled task began before its run_at: %+v", created)
+	}
+	eventsResponse, err := http.Get(server.URL + "/tasks/" + created.ID + "/events")
+	if err != nil {
+		t.Fatalf("get scheduled task events: %v", err)
+	}
+	defer eventsResponse.Body.Close()
+	var events []task.Event
+	if err := json.NewDecoder(eventsResponse.Body).Decode(&events); err != nil {
+		t.Fatalf("decode scheduled task events: %v", err)
+	}
+	scheduledEvents := 0
+	for _, event := range events {
+		if event.Type == "TASK_SCHEDULED" {
+			scheduledEvents++
+		}
+	}
+	if scheduledEvents != 1 {
+		t.Fatalf("TASK_SCHEDULED events = %d, want 1", scheduledEvents)
+	}
+}
+
+func TestUserCreatesPastTaskRunnableWithoutStartingItsTimeout(t *testing.T) {
+	pool := isolatedTestPool(t)
+	if err := migrations.Run(context.Background(), pool); err != nil {
+		t.Fatalf("migrate test schema: %v", err)
+	}
+	server := httptest.NewServer(api.New(store.New(pool, store.Options{})))
+	t.Cleanup(server.Close)
+
+	const runAtValue = "2001-02-03T04:05:06-05:00"
+	response, err := http.Post(server.URL+"/tasks", "application/json", bytes.NewBufferString(
+		`{"run_at":"`+runAtValue+`","steps":[{"type":"echo","input":{"value":"past"}}]}`,
+	))
+	if err != nil {
+		t.Fatalf("create past task: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("create status = %d, want %d", response.StatusCode, http.StatusCreated)
+	}
+	var created task.Task
+	if err := json.NewDecoder(response.Body).Decode(&created); err != nil {
+		t.Fatalf("decode past task: %v", err)
+	}
+	expectedRunAt, err := time.Parse(time.RFC3339Nano, runAtValue)
+	if err != nil {
+		t.Fatalf("parse expected run_at: %v", err)
+	}
+	if created.Status != task.StatusRunnable || !created.RunAt.Equal(expectedRunAt) {
+		t.Fatalf("created past task status/run_at = %s/%s, want RUNNABLE/%s", created.Status, created.RunAt, expectedRunAt)
+	}
+	if created.FirstStartedAt != nil || created.DeadlineAt != nil || created.LeaseVersion != 0 {
+		t.Fatalf("past run_at started task timeout before a claim: %+v", created)
 	}
 }
 

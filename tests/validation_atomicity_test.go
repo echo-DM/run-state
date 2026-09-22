@@ -34,7 +34,9 @@ func TestInvalidWorkflowDefinitionsAreRejectedWithoutPersistence(t *testing.T) {
 		"empty sequence":             `{"steps":[]}`,
 		"too many steps":             `{"steps":[` + strings.Join(oneHundredOne, ",") + `]}`,
 		"unknown type":               `{"steps":[{"type":"missing","input":{}}]}`,
-		"scheduled not implemented":  `{"run_at":null,"steps":[{"type":"echo","input":{"value":1}}]}`,
+		"run_at null":                `{"run_at":null,"steps":[{"type":"echo","input":{"value":1}}]}`,
+		"run_at without timezone":    `{"run_at":"2026-09-22T10:00:00","steps":[{"type":"echo","input":{"value":1}}]}`,
+		"run_at is not a string":     `{"run_at":123,"steps":[{"type":"echo","input":{"value":1}}]}`,
 		"invalid normal input":       `{"steps":[{"type":"sleep","input":{"duration":"soon"}}]}`,
 		"first step previous output": `{"steps":[{"type":"echo","input":{"value":{"$ref":"previous_output"}}}]}`,
 		"unknown input reference":    `{"steps":[{"type":"echo","input":{"value":{"$ref":"future"}}}]}`,
@@ -81,6 +83,18 @@ func TestCreationAndCompletionRollBackWhenEventWriteFails(t *testing.T) {
 	installRejectingEventTrigger(t, pool, "TASK_CREATED")
 	if _, err := database.CreateTask(ctx, definition); err == nil {
 		t.Fatal("creation succeeded while TASK_CREATED event was rejected")
+	}
+	assertTableCount(t, pool, "tasks", 0)
+	assertTableCount(t, pool, "task_steps", 0)
+	dropRejectingEventTrigger(t, pool)
+	futureRunAt := time.Now().Add(time.Minute)
+	installRejectingEventTrigger(t, pool, "TASK_SCHEDULED")
+	if _, err := database.CreateTask(ctx, task.Definition{
+		RunAt:              &futureRunAt,
+		TaskTimeoutSeconds: 60,
+		Steps:              definition.Steps,
+	}); err == nil {
+		t.Fatal("scheduled creation succeeded while TASK_SCHEDULED event was rejected")
 	}
 	assertTableCount(t, pool, "tasks", 0)
 	assertTableCount(t, pool, "task_steps", 0)

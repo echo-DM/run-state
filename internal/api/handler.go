@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/dimen61/runstate/internal/executor"
 	"github.com/dimen61/runstate/internal/store"
@@ -158,8 +159,17 @@ func (handler *Handler) getTask(writer http.ResponseWriter, request *http.Reques
 }
 
 func validateDefinition(input createTaskRequest) (task.Definition, error) {
+	var runAt *time.Time
 	if len(input.RunAt) > 0 {
-		return task.Definition{}, errors.New("scheduled tasks are not implemented")
+		var value string
+		if err := json.Unmarshal(input.RunAt, &value); err != nil {
+			return task.Definition{}, errors.New("run_at must be an RFC3339 timestamp with an explicit timezone")
+		}
+		parsed, err := time.Parse(time.RFC3339Nano, value)
+		if err != nil {
+			return task.Definition{}, errors.New("run_at must be an RFC3339 timestamp with an explicit timezone")
+		}
+		runAt = &parsed
 	}
 	if len(input.Steps) == 0 || len(input.Steps) > 100 {
 		return task.Definition{}, errors.New("steps must contain between 1 and 100 items")
@@ -171,7 +181,7 @@ func validateDefinition(input createTaskRequest) (task.Definition, error) {
 	if taskTimeoutSeconds <= 0 {
 		return task.Definition{}, errors.New("task_timeout_seconds must be positive")
 	}
-	definition := task.Definition{TenantID: input.TenantID, TaskTimeoutSeconds: taskTimeoutSeconds}
+	definition := task.Definition{TenantID: input.TenantID, RunAt: runAt, TaskTimeoutSeconds: taskTimeoutSeconds}
 	for index, step := range input.Steps {
 		if len(step.Input) == 0 || len(step.Input) > maxDocumentBytes || !json.Valid(step.Input) {
 			return task.Definition{}, fmt.Errorf("step %d: input must be valid JSON no larger than 1 MiB", index)
